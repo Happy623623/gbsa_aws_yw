@@ -37,6 +37,11 @@ from interview_evidence.reporting.application.requirement_assessment import (
     RequirementEvidenceCandidate,
 )
 from interview_evidence.reporting.domain.timeline import TranscriptSegment
+from interview_evidence.runtime.controlproof_faults import ControlProofReportingFaultGuard
+from interview_evidence.runtime.controlproof_model_substitute import (
+    resolve_controlproof_model,
+    validate_controlproof_test_controls,
+)
 from interview_evidence.runtime.document_ai import create_document_extractor
 from interview_evidence.shared.aws_clients.ports import (
     ConsumableQueue,
@@ -317,6 +322,7 @@ class ReportRequestedEventHandler:
         assistant_projector: ReportSearchProjector | None = None,
         submission: SubmissionAnalysisPublic | None = None,
         embedder: TextEmbedder | None = None,
+        controlproof_fault_guard: ControlProofReportingFaultGuard | None = None,
     ) -> None:
         self._company = company
         self._interview = interview
@@ -326,9 +332,13 @@ class ReportRequestedEventHandler:
         self._assistant_projector = assistant_projector
         self._submission = submission
         self._embedder = embedder
+        self._controlproof_fault_guard = controlproof_fault_guard
 
     def __call__(self, context: TenantContext, event: OutboxEvent) -> object:
         session_id = UUID(str(event.payload["interview_session_id"]))
+        if self._controlproof_fault_guard is not None:
+            # This must remain before every report read/write or external model call.
+            self._controlproof_fault_guard.before_report_side_effect(event)
         snapshot = self._interview.get_session_snapshot(context, session_id=session_id)
         criterion = self._company.get_criterion_version(
             context,
@@ -659,7 +669,10 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
     from interview_evidence.runtime.aws import create_aws_runtime_dependencies
     from interview_evidence.runtime.production import create_production_runtime
 
+    validate_controlproof_test_controls(environment)
+    fault_guard = ControlProofReportingFaultGuard.from_environment(environment)
     aws = create_aws_runtime_dependencies(environment)
+    report_model = resolve_controlproof_model(environment, aws.model)
     database = RequestScopedDatabase(aws.database_url)
     runtime = create_production_runtime(
         environment,
@@ -671,6 +684,8 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
         database=database,
         metrics=aws.metrics,
         queues=aws.queues,
+        # Keep the fixed fixture scoped to report assessors below; unrelated API AI calls
+        # continue to use the normal dependency and cannot accidentally receive report JSON.
         model=aws.model,
         speech_to_text=aws.speech_to_text,
         text_to_speech=aws.text_to_speech,
@@ -800,12 +815,12 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
                     lane_d.repository,
                     EvidenceService(lane_d.repository),
                     CriterionAssessor(
-                        aws.model,
+                        report_model,
                         metrics=metrics,
                         require_scores=True,
                     ),
                     RequirementAssessor(
-                        aws.model,
+                        report_model,
                         require_assessment=True,
                     ),
                 ),
@@ -813,6 +828,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
                 assistant_projector=assistant_projector,
                 submission=submission,
                 embedder=aws.embedder,
+                controlproof_fault_guard=fault_guard,
             ),
             "deletion.requested": DeletionRequestedEventHandler(
                 deletion_service,

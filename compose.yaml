@@ -1,5 +1,15 @@
 name: interview-evidence-platform
 
+# The application processes run on the host, so this reusable block documents the exact
+# opt-in variables they receive rather than pretending the worker is a Compose service.
+# Both test controls remain disabled by default. CONTROLPROOF_FAULT_ROOT must resolve to
+# the same host directory for the WhyYou worker and ControlProof runner.
+x-controlproof-test-controls: &controlproof-test-controls
+  CONTROLPROOF_TEST_HOOKS_ENABLED: ${CONTROLPROOF_TEST_HOOKS_ENABLED:-false}
+  CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED: ${CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED:-false}
+  CONTROLPROOF_MODEL_FIXTURE_ID: ${CONTROLPROOF_MODEL_FIXTURE_ID:-h03-report-v1}
+  CONTROLPROOF_FAULT_ROOT: ${CONTROLPROOF_FAULT_ROOT:-.controlproof/faults}
+
 # Local infrastructure only -- Postgres, LocalStack and Mailpit. The API and worker are
 # here: they run on the host with `make api` / `make worker`, against the production runtime
 # (`create_production_runtime`) that the deployed environment uses. There is no separate local

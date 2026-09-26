@@ -106,6 +106,10 @@ from interview_evidence.reporting.application.requirement_assessment import (
     RequirementAssessor,
 )
 from interview_evidence.reporting.application.transcript_service import TranscriptService
+from interview_evidence.runtime.controlproof_model_substitute import (
+    controlproof_health,
+    validate_controlproof_test_controls,
+)
 from interview_evidence.runtime.email import create_local_email_sender
 from interview_evidence.runtime.speech import create_speech_runtime_dependencies
 from interview_evidence.shared.aws_clients.ports import (
@@ -195,6 +199,7 @@ def create_production_runtime(
     speech_to_text: SpeechToText | None = None,
     text_to_speech: TextToSpeech | None = None,
 ) -> Runtime:
+    validate_controlproof_test_controls(environment)
     streaming_speech = create_speech_runtime_dependencies(environment)
     email_sender = email_sender or create_local_email_sender(environment)
     applicant_access_base_url = _applicant_access_base_url(environment)
@@ -518,6 +523,13 @@ def create_production_runtime(
         readiness=readiness,
     )
     root.exception_handlers.update(lane_d.app.exception_handlers)
+    if environment.get("APP_ENVIRONMENT", "").strip().casefold() in {"local", "test"}:
+        root.add_api_route(
+            "/internal/controlproof/health",
+            lambda: controlproof_health(environment),
+            methods=["GET"],
+            include_in_schema=False,
+        )
     database.install_http_transaction_middleware(root)
     return Runtime(
         app=root,
