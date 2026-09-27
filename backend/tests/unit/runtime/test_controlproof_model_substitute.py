@@ -7,8 +7,10 @@ import pytest
 from interview_evidence.runtime.controlproof_model_substitute import (
     FIXTURE_DIGEST,
     FIXTURE_ID,
+    ControlProofFixedEmbedder,
     ControlProofFixedModel,
     controlproof_health,
+    resolve_controlproof_embedder,
     resolve_controlproof_model,
     validate_controlproof_test_controls,
 )
@@ -35,6 +37,7 @@ def _input(payload):
 def test_model_substitute_is_disabled_by_default() -> None:
     fallback = object()
     assert resolve_controlproof_model({"APP_ENVIRONMENT": "local"}, fallback) is fallback
+    assert resolve_controlproof_embedder({"APP_ENVIRONMENT": "local"}, fallback) is fallback
 
 
 @pytest.mark.parametrize(
@@ -100,3 +103,14 @@ def test_fixed_requirement_result_never_calls_external_fallback() -> None:
     )
     assert result["signals"][0]["evidence_id"] == evidence_id
     assert result["signals"][0]["relation"] == "partially_supports"
+
+
+def test_fixed_embedder_is_deterministic_and_has_requested_dimensions() -> None:
+    embedder = ControlProofFixedEmbedder()
+
+    first = embedder.embed(_context(), "합성 지원자 리포트", dimensions=32)
+    second = embedder.embed(_context(), "합성 지원자 리포트", dimensions=32)
+
+    assert first == second
+    assert len(first) == 32
+    assert sum(value * value for value in first) == pytest.approx(1.0)

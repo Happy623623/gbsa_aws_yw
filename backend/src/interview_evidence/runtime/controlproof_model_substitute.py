@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
@@ -82,6 +83,28 @@ class ControlProofFixedModel:
         raise ValueError(f"ControlProof fixed model does not support task: {task}")
 
 
+class ControlProofFixedEmbedder:
+    """Deterministic local vector source for ControlProof-only report projection."""
+
+    model_id = "controlproof-fixed-embedding-v1"
+    embedding_version = "controlproof-h03-v1"
+
+    def embed(
+        self,
+        context: TenantContext,
+        text: str,
+        *,
+        dimensions: int = 1024,
+    ) -> tuple[float, ...]:
+        require_tenant_context(context)
+        if dimensions < 1:
+            raise ValueError("embedding dimensions must be positive")
+        digest = hashlib.sha256(text.encode()).digest()
+        values = tuple((digest[index % len(digest)] - 127.5) / 127.5 for index in range(dimensions))
+        magnitude = math.sqrt(sum(value * value for value in values))
+        return tuple(value / magnitude for value in values)
+
+
 def resolve_controlproof_model(
     environment: Mapping[str, str],
     fallback: Any,
@@ -93,6 +116,19 @@ def resolve_controlproof_model(
     if requested != FIXTURE_ID:
         raise RuntimeError("unsupported ControlProof model fixture ID")
     return ControlProofFixedModel()
+
+
+def resolve_controlproof_embedder(
+    environment: Mapping[str, str],
+    fallback: Any,
+) -> Any:
+    validate_controlproof_test_controls(environment)
+    if not _enabled(environment):
+        return fallback
+    requested = environment.get("CONTROLPROOF_MODEL_FIXTURE_ID", FIXTURE_ID).strip()
+    if requested != FIXTURE_ID:
+        raise RuntimeError("unsupported ControlProof model fixture ID")
+    return ControlProofFixedEmbedder()
 
 
 def controlproof_health(environment: Mapping[str, str]) -> dict[str, Any]:

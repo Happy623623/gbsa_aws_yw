@@ -39,6 +39,7 @@ from interview_evidence.reporting.application.requirement_assessment import (
 from interview_evidence.reporting.domain.timeline import TranscriptSegment
 from interview_evidence.runtime.controlproof_faults import ControlProofReportingFaultGuard
 from interview_evidence.runtime.controlproof_model_substitute import (
+    resolve_controlproof_embedder,
     resolve_controlproof_model,
     validate_controlproof_test_controls,
 )
@@ -673,6 +674,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
     fault_guard = ControlProofReportingFaultGuard.from_environment(environment)
     aws = create_aws_runtime_dependencies(environment)
     report_model = resolve_controlproof_model(environment, aws.model)
+    report_embedder = resolve_controlproof_embedder(environment, aws.embedder)
     database = RequestScopedDatabase(aws.database_url)
     runtime = create_production_runtime(
         environment,
@@ -687,6 +689,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
         # Keep the fixed fixture scoped to report assessors below; unrelated API AI calls
         # continue to use the normal dependency and cannot accidentally receive report JSON.
         model=aws.model,
+        embedder=report_embedder,
         speech_to_text=aws.speech_to_text,
         text_to_speech=aws.text_to_speech,
     )
