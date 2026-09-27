@@ -580,11 +580,17 @@ def create_company_router(
         body: FinalDecisionCreate,
         scope: Scope,
         idempotency_key: IdempotencyKey,
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | JSONResponse:
         del idempotency_key
         report = repository.get_report_for_invitation(scope.context, invitation_id)
         if report is None:
-            raise HTTPException(status_code=404)
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content={
+                    "code": "REPORT_NOT_AVAILABLE",
+                    "detail": "Final report is not available.",
+                },
+            )
         if invitations is None or not hasattr(invitations, "move_to_recruiting_stage"):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

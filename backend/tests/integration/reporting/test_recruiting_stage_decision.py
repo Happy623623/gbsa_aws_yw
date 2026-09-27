@@ -108,6 +108,8 @@ def context() -> TenantContext:
 
 def client(
     writer: DecisionWriter,
+    *,
+    with_report: bool = True,
 ) -> tuple[TestClient, SQLAlchemyReportingRepository, Session]:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -117,23 +119,24 @@ def client(
     Base.metadata.create_all(engine)
     session = Session(engine)
     repository = SQLAlchemyReportingRepository(session)
-    repository.save_report(
-        context(),
-        Report(
-            report_id=REPORT_ID,
-            company_id=COMPANY_ID,
-            interview_session_id=SESSION_ID,
-            invitation_id=INVITATION_ID,
-            version=1,
-            kind=ReportKind.AI_ORIGINAL,
-            model_version="model-v1",
-            prompt_version="prompt-v1",
-            config_version="config-v1",
-            status=ReportStatus.READY,
-            summary="evidence summary",
-            created_at=NOW,
-        ),
-    )
+    if with_report:
+        repository.save_report(
+            context(),
+            Report(
+                report_id=REPORT_ID,
+                company_id=COMPANY_ID,
+                interview_session_id=SESSION_ID,
+                invitation_id=INVITATION_ID,
+                version=1,
+                kind=ReportKind.AI_ORIGINAL,
+                model_version="model-v1",
+                prompt_version="prompt-v1",
+                config_version="config-v1",
+                status=ReportStatus.READY,
+                summary="evidence summary",
+                created_at=NOW,
+            ),
+        )
     runtime = create_lane_d_runtime(
         principal_provider=FakePrincipalProvider(
             company_principals={
@@ -194,6 +197,26 @@ def test_stale_pipeline_version_records_no_final_decision() -> None:
 
     assert response.status_code == 409
     assert repository.list_reviews(context(), REPORT_ID) == ()
+    session.close()
+
+
+def test_final_decision_without_report_returns_stable_reason_and_writes_nothing() -> None:
+    writer = DecisionWriter()
+    http, _repository, session = client(writer, with_report=False)
+
+    response = http.post(
+        f"/v1/invitations/{INVITATION_ID}/final-decisions",
+        headers={"Authorization": "Bearer company-token", "Idempotency-Key": "decision-3"},
+        json={"recruiting_stage_id": str(STAGE_ID), "expected_pipeline_version": 3},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "code": "REPORT_NOT_AVAILABLE",
+        "detail": "Final report is not available.",
+    }
+    assert writer.moves == []
+    assert writer.advances == []
     session.close()
 
 

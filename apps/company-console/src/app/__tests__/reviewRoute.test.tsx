@@ -5,7 +5,13 @@
  * so they pass even when the adapter feeds the component a UUID. Only a test that
  * goes through `ReviewRoute` with a real API payload catches that.
  */
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -268,10 +274,13 @@ describe("ReviewRoute", () => {
         const url = String(input);
         if (url.endsWith("/final-decisions")) {
           return Promise.resolve(
-            new Response(JSON.stringify({ detail: "stale applicant pipeline version" }), {
-              status: 409,
-              headers: { "Content-Type": "application/json" },
-            }),
+            new Response(
+              JSON.stringify({ detail: "stale applicant pipeline version" }),
+              {
+                status: 409,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
           );
         }
         const body = url.endsWith("/timeline")
@@ -405,4 +414,54 @@ describe("ReviewRoute", () => {
       }
     },
   );
+
+  it("shows an explicit delay warning while a report remains queued", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: RequestInfo | URL) => {
+          const url = String(input);
+          const body = url.endsWith("/timeline")
+            ? TIMELINE_PAYLOAD
+            : url.endsWith("/recruiting-state")
+              ? {
+                  invitation_id: INVITATION_ID,
+                  position_id: "00000000-0000-7000-8000-000000000006",
+                  recruiting_stage_id: "00000000-0000-7000-8000-000000000007",
+                  pipeline_row_version: 1,
+                  stages: [],
+                }
+              : { status: "queued", retryable: true, message: null };
+          return Promise.resolve(
+            new Response(JSON.stringify(body), {
+              status: url.endsWith("/report") ? 202 : 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }),
+      );
+
+      renderReview();
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByRole("status")).toBeTruthy();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8000);
+      });
+
+      const warning = screen.getByRole("alert");
+      expect(warning.textContent).toContain(
+        "최종 리포트 생성이 지연되고 있습니다",
+      );
+      expect(warning.textContent).toContain(
+        "최종 채용 결정을 확정할 수 없습니다",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

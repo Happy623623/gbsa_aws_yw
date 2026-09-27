@@ -78,6 +78,7 @@ const DEMO_COMPANY_TOKEN = import.meta.env.VITE_DEMO_COMPANY_TOKEN?.trim();
 const AUTOMATED_INTERVIEW_ENABLED =
   import.meta.env.DEV ||
   import.meta.env.VITE_AUTOMATED_INTERVIEW_ENABLED === "true";
+const REPORT_DELAY_WARNING_MS = 8000;
 
 function toPositionRequest(
   input: Parameters<HiringWorkspaceApi["createPosition"]>[0],
@@ -1075,6 +1076,7 @@ export function ReviewRoute() {
   const [recruitingState, setRecruitingState] =
     useState<CompanyApplicantRecruitingState | null>(null);
   const [reportPending, setReportPending] = useState(false);
+  const [reportDelayed, setReportDelayed] = useState(false);
   const [error, setError] = useState(false);
   const authenticated =
     !AUTH_CONFIG || Boolean(getCompanyAccessToken(localStorage));
@@ -1090,6 +1092,14 @@ export function ReviewRoute() {
     if (!authenticated) return;
     let active = true;
     let retryTimer: number | undefined;
+    let delayTimer: number | undefined;
+
+    function scheduleDelayWarning() {
+      if (delayTimer !== undefined) return;
+      delayTimer = window.setTimeout(() => {
+        if (active) setReportDelayed(true);
+      }, REPORT_DELAY_WARNING_MS);
+    }
 
     async function loadReview() {
       try {
@@ -1106,19 +1116,24 @@ export function ReviewRoute() {
           setReport(nextReport);
           setTimeline(nextTimeline);
           setReportPending(false);
+          setReportDelayed(false);
           setError(false);
+          if (delayTimer !== undefined) window.clearTimeout(delayTimer);
           return;
         }
         setReportPending(true);
+        scheduleDelayWarning();
         retryTimer = window.setTimeout(() => void loadReview(), 2000);
       } catch {
         if (!active) return;
         if (automatedReview) {
           setReportPending(true);
+          scheduleDelayWarning();
           retryTimer = window.setTimeout(() => void loadReview(), 2000);
           return;
         }
         setReportPending(false);
+        setReportDelayed(false);
         setError(true);
       }
     }
@@ -1127,6 +1142,7 @@ export function ReviewRoute() {
     return () => {
       active = false;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      if (delayTimer !== undefined) window.clearTimeout(delayTimer);
     };
   }, [authenticated, automatedReview, sessionId]);
 
@@ -1263,13 +1279,27 @@ export function ReviewRoute() {
               </p>
             </div>
           </header>
-          <div className={ASYNC_STATE} role={error ? "alert" : "status"}>
+          <div
+            className={ASYNC_STATE}
+            role={error || reportDelayed ? "alert" : "status"}
+            data-report-state={
+              error
+                ? "error"
+                : reportDelayed
+                  ? "delayed"
+                  : reportPending
+                    ? "pending"
+                    : "loading"
+            }
+          >
             <p className="text-[12px]">
               {error
                 ? "리포트를 불러올 수 없습니다. 잠시 후 다시 시도해 주세요."
-                : automatedReview || reportPending
-                  ? `${automatedReview ? "자동 면접" : "면접"}이 끝났습니다. 최종 리포트를 생성하고 있습니다.`
-                  : "리포트와 영상 타임라인을 불러오는 중입니다."}
+                : reportDelayed
+                  ? "최종 리포트 생성이 지연되고 있습니다. 리포트가 준비될 때까지 최종 채용 결정을 확정할 수 없습니다."
+                  : automatedReview || reportPending
+                    ? `${automatedReview ? "자동 면접" : "면접"}이 끝났습니다. 최종 리포트를 생성하고 있습니다.`
+                    : "리포트와 영상 타임라인을 불러오는 중입니다."}
             </p>
           </div>
         </section>
