@@ -107,6 +107,21 @@ class PipelineRepository:
         return updated
 
 
+class ReadyReportResolver:
+    class Snapshot:
+        report_status = "ready"
+
+    def get_invitation_review(
+        self,
+        context: TenantContext,
+        *,
+        invitation_id: UUID,
+    ) -> Snapshot:
+        context.assert_company(COMPANY_ID)
+        assert invitation_id == UUID("00000000-0000-7000-8000-000000000205")
+        return self.Snapshot()
+
+
 def context() -> TenantContext:
     return TenantContext(
         company_id=COMPANY_ID,
@@ -209,6 +224,7 @@ def test_service_backfills_from_system_progress_and_moves_the_latest_state() -> 
                 expected_version=2,
             ),
         ),
+        invitation_reviews=ReadyReportResolver(),
     )
 
     assert moved[0].recruiting_stage_id == final_pass.recruiting_stage_id

@@ -2,7 +2,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
+from interview_evidence.company_management.application.hiring_service import (
+    ApplicantPipelineMove,
+    HiringService,
+)
+from interview_evidence.company_management.domain.company import Position, PositionStatus
+from interview_evidence.company_management.domain.hiring import Invitation, RecruitingStage
 from interview_evidence.reporting.api import create_lane_d_runtime
 from interview_evidence.reporting.application.deletion_service import DeletionService
 from interview_evidence.reporting.application.public import ReportingPublic
@@ -16,6 +23,7 @@ from interview_evidence.reporting.repositories.postgres import (
 from interview_evidence.shared.audit import InMemoryAuditAppender
 from interview_evidence.shared.ids import CommandMeta, FrozenClock
 from interview_evidence.shared.security.principals import CompanyPrincipal, FakePrincipalProvider
+from interview_evidence.shared.submission_materials import DEFAULT_SUBMISSION_REQUIREMENTS
 from interview_evidence.shared.tenant import ActorType, TenantContext
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -29,6 +37,8 @@ SESSION_ID = UUID("00000000-0000-7000-8000-000000000004")
 INVITATION_ID = UUID("00000000-0000-7000-8000-000000000005")
 POSITION_ID = UUID("00000000-0000-7000-8000-000000000006")
 STAGE_ID = UUID("00000000-0000-7000-8000-000000000007")
+REVIEW_STAGE_ID = UUID("00000000-0000-7000-8000-000000000008")
+REJECT_STAGE_ID = UUID("00000000-0000-7000-8000-000000000009")
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,112 @@ class DecisionWriter:
         assert to_state == "reviewed"
         self.advances.append(meta)
         return InvitationState(state="reviewed", row_version=5)
+
+
+class BatchDecisionRepository:
+    def __init__(self) -> None:
+        self.position = Position(
+            position_id=POSITION_ID,
+            company_id=COMPANY_ID,
+            title="백엔드 엔지니어",
+            description="서비스 개발",
+            created_by=USER_ID,
+            status=PositionStatus.ACTIVE,
+            created_at=NOW,
+        )
+        self.stages = (
+            RecruitingStage(
+                recruiting_stage_id=REVIEW_STAGE_ID,
+                company_id=COMPANY_ID,
+                position_id=POSITION_ID,
+                name="검토",
+                sort_order=0,
+            ),
+            RecruitingStage(
+                recruiting_stage_id=STAGE_ID,
+                company_id=COMPANY_ID,
+                position_id=POSITION_ID,
+                name="최종합격",
+                sort_order=1,
+            ),
+            RecruitingStage(
+                recruiting_stage_id=REJECT_STAGE_ID,
+                company_id=COMPANY_ID,
+                position_id=POSITION_ID,
+                name="불합격",
+                sort_order=2,
+            ),
+        )
+        self.invitation = Invitation.create(
+            invitation_id=INVITATION_ID,
+            company_id=COMPANY_ID,
+            position_id=POSITION_ID,
+            competency_model_version_id=UUID("00000000-0000-7000-8000-000000000010"),
+            applicant_id=UUID("00000000-0000-7000-8000-000000000011"),
+            applicant_email="candidate@example.com",
+            applicant_display_name="합성 지원자",
+            submission_requirements=DEFAULT_SUBMISSION_REQUIREMENTS,
+            token_hash="a" * 64,
+            expires_at=datetime(2026, 9, 1, tzinfo=UTC),
+            recruiting_stage_id=REVIEW_STAGE_ID,
+        )
+
+    def get_position(self, context: TenantContext, position_id: UUID) -> Position:
+        context.assert_company(COMPANY_ID)
+        if position_id != POSITION_ID:
+            raise LookupError("position not found")
+        return self.position
+
+    def list_recruiting_stages(
+        self,
+        context: TenantContext,
+        position_id: UUID | None = None,
+    ) -> tuple[RecruitingStage, ...]:
+        context.assert_company(COMPANY_ID)
+        return tuple(
+            stage
+            for stage in self.stages
+            if position_id is None or stage.position_id == position_id
+        )
+
+    def list_invitations(
+        self,
+        context: TenantContext,
+        position_id: UUID,
+    ) -> tuple[Invitation, ...]:
+        context.assert_company(COMPANY_ID)
+        return (self.invitation,) if position_id == POSITION_ID else ()
+
+    def get_invitation_for_update(
+        self,
+        context: TenantContext,
+        invitation_id: UUID,
+    ) -> Invitation:
+        context.assert_company(COMPANY_ID)
+        if invitation_id != INVITATION_ID:
+            raise LookupError("invitation not found")
+        return self.invitation
+
+    def save_invitation(
+        self,
+        context: TenantContext,
+        invitation: Invitation,
+    ) -> Invitation:
+        context.assert_company(COMPANY_ID)
+        self.invitation = invitation
+        return invitation
+
+
+class MissingReportResolver:
+    def get_invitation_review(
+        self,
+        context: TenantContext,
+        *,
+        invitation_id: UUID,
+    ) -> None:
+        context.assert_company(COMPANY_ID)
+        assert invitation_id == INVITATION_ID
+        return None
 
 
 def context() -> TenantContext:
@@ -218,6 +334,31 @@ def test_final_decision_without_report_returns_stable_reason_and_writes_nothing(
     assert writer.moves == []
     assert writer.advances == []
     session.close()
+
+
+@pytest.mark.parametrize("target_stage_id", [STAGE_ID, REJECT_STAGE_ID])
+def test_batch_final_stage_without_report_is_rejected_without_pipeline_write(
+    target_stage_id: UUID,
+) -> None:
+    repository = BatchDecisionRepository()
+    service = HiringService(
+        repository,  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        FrozenClock(NOW),
+        object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="final report is not available"):
+        service.move_applicants(
+            context(),
+            position_id=POSITION_ID,
+            target_stage_id=target_stage_id,
+            moves=(ApplicantPipelineMove(INVITATION_ID, 1),),
+            invitation_reviews=MissingReportResolver(),  # type: ignore[arg-type]
+        )
+
+    assert repository.invitation.recruiting_stage_id == REVIEW_STAGE_ID
+    assert repository.invitation.pipeline_row_version == 1
 
 
 def test_legacy_fixed_decision_remains_readable_during_migration() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
 from uuid import UUID
 
 from interview_evidence.company_management.adapters.applicant_session import (
@@ -45,6 +46,20 @@ class ApplicantRecruitingState:
 
     invitation: Invitation
     stages: tuple[RecruitingStage, ...]
+
+
+class InvitationReviewSnapshot(Protocol):
+    @property
+    def report_status(self) -> str: ...
+
+
+class InvitationReviewResolver(Protocol):
+    def get_invitation_review(
+        self,
+        context: TenantContext,
+        *,
+        invitation_id: UUID,
+    ) -> InvitationReviewSnapshot | None: ...
 
 
 class HiringService:
@@ -285,14 +300,16 @@ class HiringService:
         position_id: UUID,
         target_stage_id: UUID,
         moves: tuple[ApplicantPipelineMove, ...],
+        invitation_reviews: InvitationReviewResolver | None = None,
     ) -> tuple[Invitation, ...]:
         if not moves or len(moves) > 1000:
             raise ValueError("between 1 and 1000 applicants must be moved")
         if len({move.invitation_id for move in moves}) != len(moves):
             raise ValueError("each applicant may only appear once")
         stages = self.ensure_default_stages(context, position_id)
-        _stage_in_position(stages, target_stage_id, position_id)
-        updated: list[Invitation] = []
+        target_stage = _stage_in_position(stages, target_stage_id, position_id)
+        final_stage = target_stage.name in {"최종합격", "불합격"}
+        pending: list[Invitation] = []
         for move in moves:
             invitation = self._repository.get_invitation_for_update(
                 context,
@@ -300,12 +317,23 @@ class HiringService:
             )
             if invitation.position_id != position_id:
                 raise ValueError("applicant does not belong to the selected position")
+            if final_stage:
+                review = (
+                    invitation_reviews.get_invitation_review(
+                        context,
+                        invitation_id=invitation.invitation_id,
+                    )
+                    if invitation_reviews is not None
+                    else None
+                )
+                if review is None or review.report_status != "ready":
+                    raise ValueError("final report is not available")
             moved = invitation.move_to_recruiting_stage(
                 target_stage_id,
                 expected_version=move.expected_version,
             )
-            updated.append(self._repository.save_invitation(context, moved))
-        return tuple(updated)
+            pending.append(moved)
+        return tuple(self._repository.save_invitation(context, moved) for moved in pending)
 
 
 def _default_stage_name(status: InvitationStatus) -> str:

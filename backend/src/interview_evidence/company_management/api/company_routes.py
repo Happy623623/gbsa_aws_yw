@@ -1004,6 +1004,7 @@ def create_company_router(
                     )
                     for item in body.applicants
                 ),
+                invitation_reviews=invitation_reviews,
             )
         except TenantScopedResourceNotFound as error:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from error
