@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 from interview_evidence.shared.tenant import TenantContext, require_tenant_context
@@ -144,10 +145,19 @@ def controlproof_health(environment: Mapping[str, str]) -> dict[str, Any]:
     }
     return {
         "fault_hooks_enabled": hooks_enabled,
+        "fault_root_digest": _fault_root_digest(environment) if hooks_enabled else None,
         "model_substitute_enabled": model_enabled,
         "fixture_id": FIXTURE_ID if model_enabled else None,
         "fixture_digest": FIXTURE_DIGEST if model_enabled else None,
     }
+
+
+def _fault_root_digest(environment: Mapping[str, str]) -> str | None:
+    raw = environment.get("CONTROLPROOF_FAULT_ROOT", "").strip()
+    if not raw:
+        return None
+    normalized = Path(raw).resolve().as_posix().casefold().encode("utf-8")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 def _task_payload(model_input: Mapping[str, Any]) -> dict[str, Any]:

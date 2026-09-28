@@ -48,8 +48,10 @@ def test_local_health_exposes_no_secret_or_model_output() -> None:
     )
     assert set(result) == {
         "fault_hooks_enabled",
+        "fault_root_digest",
         "model_substitute_enabled",
         "fixture_id",
         "fixture_digest",
     }
+    assert result["fault_root_digest"] is None
     assert result["fixture_digest"] == FIXTURE_DIGEST

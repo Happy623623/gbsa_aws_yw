@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from uuid import uuid4
 
@@ -58,10 +59,28 @@ def test_health_exposes_only_control_state_and_fixture_identity() -> None:
     )
     assert health == {
         "fault_hooks_enabled": False,
+        "fault_root_digest": None,
         "model_substitute_enabled": True,
         "fixture_id": FIXTURE_ID,
         "fixture_digest": FIXTURE_DIGEST,
     }
+
+
+def test_health_exposes_only_a_digest_for_the_shared_fault_root(tmp_path) -> None:
+    fault_root = tmp_path / "faults"
+    health = controlproof_health(
+        {
+            "APP_ENVIRONMENT": "test",
+            "CONTROLPROOF_TEST_HOOKS_ENABLED": "true",
+            "CONTROLPROOF_FAULT_ROOT": str(fault_root),
+        }
+    )
+
+    expected = hashlib.sha256(
+        fault_root.resolve().as_posix().casefold().encode("utf-8")
+    ).hexdigest()
+    assert health["fault_root_digest"] == expected
+    assert str(fault_root) not in json.dumps(health)
 
 
 def test_fixed_model_is_deterministic_and_cites_input_evidence() -> None:
