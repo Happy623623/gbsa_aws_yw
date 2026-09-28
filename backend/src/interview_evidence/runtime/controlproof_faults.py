@@ -16,9 +16,13 @@ from interview_evidence.shared.messaging.outbox import OutboxEvent
 LOGGER = logging.getLogger(__name__)
 FAULT_SCHEMA = "controlproof.whyyou-fault.v1"
 FAULT_TYPE = "reporting_handler_timeout_v1"
+AFTER_FAULT_TYPE = "reporting_after_commit_drop_ack_v1"
 RECEIPT_SCHEMA = "controlproof.whyyou-fault-receipt.v2"
+DUPLICATE_ACK_SCHEMA = "controlproof.whyyou-duplicate-ack.v1"
 BEFORE_FAULT_VARIANT = "BEFORE_RESULT_DURABLE"
 BEFORE_BOUNDARY = "BEFORE_REPORT_SIDE_EFFECT"
+AFTER_FAULT_VARIANT = "AFTER_RESULT_DURABLE_BEFORE_COMPLETION"
+AFTER_BOUNDARY = "AFTER_DB_COMMIT_BEFORE_SQS_ACK"
 ALLOWED_ENVIRONMENTS = frozenset({"local", "test"})
 
 
@@ -59,7 +63,7 @@ class ControlProofReportingFaultGuard:
                 extra={"reason": "invalid_session"},
             )
             return
-        marker = self._read_marker(session_id)
+        marker = self._read_marker(session_id, expected_fault_type=FAULT_TYPE)
         if marker is None:
             return
         receipt = {
@@ -85,7 +89,111 @@ class ControlProofReportingFaultGuard:
         LOGGER.warning("CONTROLPROOF_FAULT_TRIGGERED", extra=receipt)
         raise TimeoutError("ControlProof local/test reporting fault triggered")
 
-    def _read_marker(self, session_id: UUID) -> dict[str, str] | None:
+    def after_commit_before_ack(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> bool:
+        """Consume one AFTER marker after commit and request one omitted ack."""
+        marker = self._matching_after_marker(event, consumer_name=consumer_name)
+        if marker is None:
+            return False
+        consumed = self._consumed_path(marker["run_id"], marker["interview_session_id"])
+        consumed.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(consumed, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(b"consumed\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            receipt = {
+                "schema_version": RECEIPT_SCHEMA,
+                "run_id": marker["run_id"],
+                "session_id": marker["interview_session_id"],
+                "outbox_event_id": str(event.outbox_event_id),
+                "event_version": event.event_version,
+                "delivery_attempt": event.delivery_attempt,
+                "fault_type": AFTER_FAULT_TYPE,
+                "fault_variant": AFTER_FAULT_VARIANT,
+                "boundary": AFTER_BOUNDARY,
+                "triggered_at": datetime.now(UTC).isoformat(),
+                "one_shot_consumed": True,
+            }
+            self._append_receipt(marker["run_id"], receipt)
+        except BaseException:
+            consumed.unlink(missing_ok=True)
+            raise
+        LOGGER.warning("CONTROLPROOF_AFTER_COMMIT_ACK_OMITTED", extra=receipt)
+        return True
+
+    def duplicate_acknowledged(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> None:
+        """Persist sanitized proof that redelivery used the processed-message branch."""
+        marker = self._matching_after_marker(event, consumer_name=consumer_name)
+        if marker is None:
+            return
+        consumed = self._consumed_path(marker["run_id"], marker["interview_session_id"])
+        if not consumed.exists():
+            return
+        receipt = {
+            "schema_version": DUPLICATE_ACK_SCHEMA,
+            "run_id": marker["run_id"],
+            "session_id": marker["interview_session_id"],
+            "outbox_event_id": str(event.outbox_event_id),
+            "event_version": event.event_version,
+            "delivery_attempt": event.delivery_attempt,
+            "consumer_name": consumer_name,
+            "handler_skipped": True,
+            "acknowledged": True,
+            "observed_at": datetime.now(UTC).isoformat(),
+        }
+        self._append_receipt(marker["run_id"], receipt)
+        LOGGER.warning("CONTROLPROOF_DUPLICATE_ACKNOWLEDGED", extra=receipt)
+
+    def _matching_after_marker(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> dict[str, str] | None:
+        if (
+            not self.enabled
+            or event.event_type != "report.generation_requested"
+            or consumer_name != "reporting-worker"
+        ):
+            return None
+        try:
+            session_id = UUID(str(event.payload.get("interview_session_id")))
+        except ValueError:
+            return None
+        return self._read_marker(session_id, expected_fault_type=AFTER_FAULT_TYPE)
+
+    def _append_receipt(self, run_id: str, receipt: dict[str, object]) -> None:
+        receipt_path = self.root / "receipts" / f"{run_id}.jsonl"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        with receipt_path.open("ab") as stream:
+            stream.write(payload + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _consumed_path(self, run_id: str, session_id: str) -> Path:
+        return self.root / "consumed" / f"{run_id}-{session_id}.after"
+
+    def _read_marker(
+        self,
+        session_id: UUID,
+        *,
+        expected_fault_type: str,
+    ) -> dict[str, str] | None:
         path = self.root / "reporting" / f"{session_id}.json"
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -96,7 +204,16 @@ class ControlProofReportingFaultGuard:
                 return None
             run_id = str(UUID(str(value["run_id"])))
             marker_session = str(UUID(str(value["interview_session_id"])))
-            if marker_session != str(session_id) or value.get("fault_type") != FAULT_TYPE:
+            if marker_session != str(session_id) or value.get("fault_type") != expected_fault_type:
+                return None
+            expected_variant = (
+                BEFORE_FAULT_VARIANT
+                if expected_fault_type == FAULT_TYPE
+                else AFTER_FAULT_VARIANT
+            )
+            if value.get("fault_variant", expected_variant) != expected_variant:
+                return None
+            if expected_fault_type == AFTER_FAULT_TYPE and value.get("one_shot") is not True:
                 return None
             issued_at = datetime.fromisoformat(str(value["issued_at"]))
             expires_at = datetime.fromisoformat(str(value["expires_at"]))

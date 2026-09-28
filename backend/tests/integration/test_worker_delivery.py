@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from interview_evidence.runtime.worker import (
@@ -282,6 +283,118 @@ def test_consumer_commits_database_before_acknowledging_sqs() -> None:
         == 1
     )
     assert operations == ["commit", "ack"]
+
+
+def test_consumer_orders_handler_processed_commit_hook_then_ack() -> None:
+    operations: list[str] = []
+
+    class OrderedQueue(InMemoryQueue):
+        def acknowledge(self, receipt_handle: str) -> None:
+            operations.append("ack")
+            super().acknowledge(receipt_handle)
+
+    class OrderedProcessed(InMemoryProcessedMessageStore):
+        def record(self, message: ProcessedMessage) -> None:
+            operations.append("processed")
+            super().record(message)
+
+    class Observer:
+        def after_commit_before_ack(self, event, *, consumer_name):
+            operations.append("after-hook")
+            return False
+
+        def duplicate_acknowledged(self, event, *, consumer_name):
+            operations.append("duplicate-receipt")
+
+    queue = OrderedQueue()
+    outbox = InMemoryOutbox()
+    outbox.append(_event())
+    OutboxDispatcher(
+        outbox=outbox,
+        queues={"analysis": queue},
+        routing={"submission.analysis_requested": "analysis"},
+    ).dispatch_once()
+    consumer = MessageConsumer(
+        consumer_name="analysis-worker",
+        queue=queue,
+        processed=OrderedProcessed(),
+        handlers={
+            "submission.analysis_requested": lambda _context, _event: operations.append(
+                "handler"
+            )
+        },
+        clock=FrozenClock(NOW),
+        delivery_observer=Observer(),
+    )
+
+    assert consumer.consume_once(
+        max_messages=1,
+        commit=lambda: operations.append("commit"),
+    ) == 1
+    assert operations == ["handler", "processed", "commit", "after-hook", "ack"]
+
+
+def test_after_commit_ack_omission_redelivers_via_processed_short_circuit() -> None:
+    calls: list[UUID] = []
+    observations: list[str] = []
+
+    class VisibilityQueue(InMemoryQueue):
+        def expire_visibility(self) -> None:
+            deliveries = tuple(self._inflight.values())
+            self._inflight.clear()
+            self._available.extend(
+                replace(
+                    delivery,
+                    receipt_handle=str(uuid4()),
+                    receive_count=delivery.receive_count + 1,
+                )
+                for delivery in deliveries
+            )
+
+    class OneShotObserver:
+        def __init__(self) -> None:
+            self.consumed = False
+
+        def after_commit_before_ack(self, event, *, consumer_name):
+            if self.consumed:
+                return False
+            self.consumed = True
+            observations.append("boundary")
+            return True
+
+        def duplicate_acknowledged(self, event, *, consumer_name):
+            observations.append(f"duplicate-ack:{event.delivery_attempt}")
+
+    queue = VisibilityQueue()
+    outbox = InMemoryOutbox()
+    outbox.append(_event())
+    OutboxDispatcher(
+        outbox=outbox,
+        queues={"analysis": queue},
+        routing={"submission.analysis_requested": "analysis"},
+    ).dispatch_once()
+    consumer = MessageConsumer(
+        consumer_name="analysis-worker",
+        queue=queue,
+        processed=InMemoryProcessedMessageStore(),
+        handlers={
+            "submission.analysis_requested": lambda _context, event: calls.append(
+                event.outbox_event_id
+            )
+        },
+        clock=FrozenClock(NOW),
+        delivery_observer=OneShotObserver(),
+    )
+
+    assert consumer.consume_once(max_messages=1) == 0
+    assert calls == [EVENT_ID]
+    assert queue.approximate_depth() == 1
+
+    queue.expire_visibility()
+    assert consumer.consume_once(max_messages=1) == 1
+    assert calls == [EVENT_ID]
+    assert observations == ["boundary", "duplicate-ack:2"]
+    assert queue.approximate_depth() == 0
 
 
 def test_consumer_extends_visibility_while_handler_is_running() -> None:

@@ -50,6 +50,43 @@ class ProcessedMessageStore(Protocol):
     def record(self, message: ProcessedMessage) -> None: ...
 
 
+class DeliveryLifecycleObserver(Protocol):
+    """Optional local/test observer around the durable-commit/SQS-ack boundary."""
+
+    def after_commit_before_ack(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> bool:
+        """Return true only when this delivery's acknowledge must be omitted."""
+
+    def duplicate_acknowledged(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> None: ...
+
+
+class NullDeliveryLifecycleObserver:
+    def after_commit_before_ack(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> bool:
+        return False
+
+    def duplicate_acknowledged(
+        self,
+        event: OutboxEvent,
+        *,
+        consumer_name: str,
+    ) -> None:
+        return None
+
+
 class InMemoryProcessedMessageStore:
     def __init__(self) -> None:
         self._messages: dict[tuple[str, UUID, int], ProcessedMessage] = {}
@@ -152,6 +189,7 @@ class MessageConsumer:
         queue_name: str | None = None,
         metrics: MetricRecorder | None = None,
         task_protection: TaskProtection | None = None,
+        delivery_observer: DeliveryLifecycleObserver | None = None,
     ) -> None:
         self._consumer_name = consumer_name
         self._queue = queue
@@ -161,6 +199,7 @@ class MessageConsumer:
         self._queue_name = queue_name or consumer_name.removesuffix("-worker")
         self._metrics = metrics or NullMetricRecorder()
         self._task_protection = task_protection or NullTaskProtection()
+        self._delivery_observer = delivery_observer or NullDeliveryLifecycleObserver()
 
     def consume_once(
         self,
@@ -175,21 +214,6 @@ class MessageConsumer:
         deliveries = self._queue.receive(max_messages=max_messages)
         self._record_queue_depth()
         for delivery in deliveries:
-            if self._processed.contains(
-                consumer_name=self._consumer_name,
-                event_id=delivery.event_id,
-                event_version=delivery.event_version,
-            ):
-                self._queue.acknowledge(delivery.receipt_handle)
-                self._record_delivery("duplicate")
-                completed += 1
-                continue
-            handler = self._handlers.get(delivery.event_type)
-            if handler is None:
-                self._queue.acknowledge(delivery.receipt_handle)
-                self._record_delivery("ignored")
-                completed += 1
-                continue
             event = OutboxEvent(
                 outbox_event_id=delivery.event_id,
                 company_id=delivery.company_id,
@@ -204,6 +228,25 @@ class MessageConsumer:
                 occurred_at=delivery.occurred_at,
                 delivery_attempt=delivery.receive_count,
             )
+            if self._processed.contains(
+                consumer_name=self._consumer_name,
+                event_id=delivery.event_id,
+                event_version=delivery.event_version,
+            ):
+                self._queue.acknowledge(delivery.receipt_handle)
+                self._delivery_observer.duplicate_acknowledged(
+                    event,
+                    consumer_name=self._consumer_name,
+                )
+                self._record_delivery("duplicate")
+                completed += 1
+                continue
+            handler = self._handlers.get(delivery.event_type)
+            if handler is None:
+                self._queue.acknowledge(delivery.receipt_handle)
+                self._record_delivery("ignored")
+                completed += 1
+                continue
             context = TenantContext(
                 company_id=delivery.company_id,
                 actor_type=ActorType.SYSTEM,
@@ -255,6 +298,12 @@ class MessageConsumer:
             except BaseException:
                 rollback_transaction()
                 raise
+            if self._delivery_observer.after_commit_before_ack(
+                event,
+                consumer_name=self._consumer_name,
+            ):
+                self._record_delivery("committed_ack_omitted")
+                continue
             self._queue.acknowledge(delivery.receipt_handle)
             self._record_delivery("completed")
             completed += 1

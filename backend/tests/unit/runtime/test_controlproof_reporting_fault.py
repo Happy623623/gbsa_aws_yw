@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from interview_evidence.runtime.controlproof_faults import (
+    AFTER_BOUNDARY,
+    AFTER_FAULT_TYPE,
+    AFTER_FAULT_VARIANT,
+    DUPLICATE_ACK_SCHEMA,
     FAULT_SCHEMA,
     FAULT_TYPE,
     ControlProofReportingFaultGuard,
@@ -142,3 +147,58 @@ def test_worker_invokes_guard_before_first_report_side_effect() -> None:
     call = handler.index("before_report_side_effect(event)")
     first_read = handler.index("get_session_snapshot(")
     assert call < first_read
+
+
+def test_after_commit_marker_is_consumed_once_and_receipt_is_fsynced(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    session_id = uuid4()
+    run_id = _write_marker(
+        tmp_path,
+        session_id,
+        fault_type=AFTER_FAULT_TYPE,
+        fault_variant=AFTER_FAULT_VARIANT,
+        one_shot=True,
+    )
+    event = _event(session_id, attempt=1)
+    guard = ControlProofReportingFaultGuard.from_environment(
+        {
+            "APP_ENVIRONMENT": "test",
+            "CONTROLPROOF_TEST_HOOKS_ENABLED": "true",
+            "CONTROLPROOF_FAULT_ROOT": str(tmp_path),
+        }
+    )
+    fsync_calls: list[int] = []
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        fsync_calls.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+
+    assert guard.after_commit_before_ack(event, consumer_name="reporting-worker") is True
+    assert guard.after_commit_before_ack(event, consumer_name="reporting-worker") is False
+
+    receipts = [
+        json.loads(line)
+        for line in (tmp_path / "receipts" / f"{run_id}.jsonl").read_text().splitlines()
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["fault_variant"] == AFTER_FAULT_VARIANT
+    assert receipts[0]["boundary"] == AFTER_BOUNDARY
+    assert receipts[0]["one_shot_consumed"] is True
+    assert len(fsync_calls) >= 2
+
+    guard.duplicate_acknowledged(
+        event.model_copy(update={"delivery_attempt": 2}),
+        consumer_name="reporting-worker",
+    )
+    duplicate = json.loads(
+        (tmp_path / "receipts" / f"{run_id}.jsonl").read_text().splitlines()[1]
+    )
+    assert duplicate["schema_version"] == DUPLICATE_ACK_SCHEMA
+    assert duplicate["handler_skipped"] is True
+    assert duplicate["acknowledged"] is True
+    assert "payload" not in duplicate

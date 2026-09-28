@@ -57,6 +57,7 @@ from interview_evidence.shared.database import RequestScopedDatabase
 from interview_evidence.shared.ids import Clock, CommandMeta, SystemClock, new_uuid7
 from interview_evidence.shared.messaging.outbox import InMemoryOutbox, Outbox, OutboxEvent
 from interview_evidence.shared.messaging.worker import (
+    DeliveryLifecycleObserver,
     EventHandler,
     InMemoryProcessedMessageStore,
     MessageConsumer,
@@ -635,6 +636,7 @@ def create_worker_runtime(
     database: RequestScopedDatabase | None = None,
     metrics: MetricRecorder | None = None,
     task_protection: TaskProtection | None = None,
+    delivery_observer: DeliveryLifecycleObserver | None = None,
 ) -> WorkerRuntime:
     active_metrics = metrics or NullMetricRecorder()
     consumers = tuple(
@@ -651,6 +653,7 @@ def create_worker_runtime(
             clock=clock,
             metrics=active_metrics,
             task_protection=task_protection,
+            delivery_observer=delivery_observer,
         )
         for queue_name, queue in queues.items()
     )
@@ -852,6 +855,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
             service="worker",
             metrics=metrics,
         ),
+        delivery_observer=fault_guard,
     )
 
 
