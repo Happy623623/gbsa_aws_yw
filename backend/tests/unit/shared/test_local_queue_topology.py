@@ -124,6 +124,33 @@ def test_reporting_retry_count_can_be_overridden_locally() -> None:
     assert policy["maxReceiveCount"] == 20
 
 
+def test_controlproof_reporting_topology_uses_exact_local_demo_contract() -> None:
+    environment = {
+        "SQS_REPORTING_MAX_RECEIVE_COUNT": "3",
+        "SQS_REPORTING_VISIBILITY_TIMEOUT_SECONDS": "5",
+    }
+    client = _provision("reporting", environment)
+    work = _work_queue_attributes(client, "reporting")
+    policy = json.loads(work["RedrivePolicy"])
+    dead_letter = client.attributes[
+        "http://localhost:4566/000000000000/iep-reporting-dlq"
+    ]
+
+    assert work["VisibilityTimeout"] == "5"
+    assert work["MessageRetentionPeriod"] == str(QUEUE_MESSAGE_RETENTION_SECONDS)
+    assert policy == {
+        "deadLetterTargetArn": policy["deadLetterTargetArn"],
+        "maxReceiveCount": 3,
+    }
+    assert policy["deadLetterTargetArn"].endswith("iep-reporting-dlq")
+    assert dead_letter["MessageRetentionPeriod"] == str(
+        DEAD_LETTER_MESSAGE_RETENTION_SECONDS
+    )
+    assert int(dead_letter["MessageRetentionPeriod"]) > int(
+        work["MessageRetentionPeriod"]
+    )
+
+
 def test_attributes_are_asserted_rather_than_passed_to_create_queue() -> None:
     """`create_queue` leaves an existing queue as it is, so a queue created before these
     attributes existed would keep the SQS defaults forever. Setting them afterwards repairs it."""

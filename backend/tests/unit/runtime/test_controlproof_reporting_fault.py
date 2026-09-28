@@ -117,8 +117,16 @@ def test_matching_marker_appends_and_fsyncs_receipt_before_timeout(
     assert receipt["run_id"] == str(run_id)
     assert receipt["session_id"] == str(session_id)
     assert receipt["outbox_event_id"] == str(event.outbox_event_id)
+    assert receipt["event_version"] == event.event_version
     assert receipt["delivery_attempt"] == 3
     assert receipt["fault_type"] == FAULT_TYPE
+    assert receipt["schema_version"] == "controlproof.whyyou-fault-receipt.v2"
+    assert receipt["fault_variant"] == "BEFORE_RESULT_DURABLE"
+    assert receipt["boundary"] == "BEFORE_REPORT_SIDE_EFFECT"
+    assert receipt["one_shot_consumed"] is False
+    serialized = json.dumps(receipt)
+    assert "email" not in serialized.casefold()
+    assert "name" not in serialized.casefold()
     assert "CONTROLPROOF_FAULT_TRIGGERED" in caplog.messages
 
 

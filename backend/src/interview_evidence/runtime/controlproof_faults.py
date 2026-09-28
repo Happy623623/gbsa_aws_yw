@@ -16,6 +16,9 @@ from interview_evidence.shared.messaging.outbox import OutboxEvent
 LOGGER = logging.getLogger(__name__)
 FAULT_SCHEMA = "controlproof.whyyou-fault.v1"
 FAULT_TYPE = "reporting_handler_timeout_v1"
+RECEIPT_SCHEMA = "controlproof.whyyou-fault-receipt.v2"
+BEFORE_FAULT_VARIANT = "BEFORE_RESULT_DURABLE"
+BEFORE_BOUNDARY = "BEFORE_REPORT_SIDE_EFFECT"
 ALLOWED_ENVIRONMENTS = frozenset({"local", "test"})
 
 
@@ -60,12 +63,17 @@ class ControlProofReportingFaultGuard:
         if marker is None:
             return
         receipt = {
+            "schema_version": RECEIPT_SCHEMA,
             "run_id": marker["run_id"],
             "session_id": str(session_id),
             "outbox_event_id": str(event.outbox_event_id),
+            "event_version": event.event_version,
             "delivery_attempt": event.delivery_attempt,
             "fault_type": FAULT_TYPE,
+            "fault_variant": BEFORE_FAULT_VARIANT,
+            "boundary": BEFORE_BOUNDARY,
             "triggered_at": datetime.now(UTC).isoformat(),
+            "one_shot_consumed": False,
         }
         receipt_path = self.root / "receipts" / f"{marker['run_id']}.jsonl"
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
