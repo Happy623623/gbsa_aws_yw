@@ -32,6 +32,9 @@ from interview_evidence.reporting.api import LaneDRuntime
 from interview_evidence.reporting.application.assessment_service import CriterionAssessor
 from interview_evidence.reporting.application.deletion_service import DeletionService
 from interview_evidence.reporting.application.evidence_service import EvidenceService
+from interview_evidence.reporting.application.failure_service import (
+    ReportGenerationFailureRecorder,
+)
 from interview_evidence.reporting.application.requirement_assessment import (
     RequirementAssessor,
     RequirementEvidenceCandidate,
@@ -44,6 +47,7 @@ from interview_evidence.runtime.controlproof_model_substitute import (
     validate_controlproof_test_controls,
 )
 from interview_evidence.runtime.document_ai import create_document_extractor
+from interview_evidence.runtime.queue_topology import queue_max_receive_count
 from interview_evidence.shared.aws_clients.ports import (
     ConsumableQueue,
     InMemoryQueue,
@@ -63,6 +67,7 @@ from interview_evidence.shared.messaging.worker import (
     MessageConsumer,
     OutboxDispatcher,
     ProcessedMessageStore,
+    RetryExhaustionObserver,
 )
 from interview_evidence.shared.operations import MetricRecorder, NullMetricRecorder
 from interview_evidence.shared.persistence import SQLProcessedMessageStore
@@ -637,8 +642,12 @@ def create_worker_runtime(
     metrics: MetricRecorder | None = None,
     task_protection: TaskProtection | None = None,
     delivery_observer: DeliveryLifecycleObserver | None = None,
+    max_receive_counts: Mapping[str, int] | None = None,
+    retry_exhaustion_observers: Mapping[str, RetryExhaustionObserver] | None = None,
 ) -> WorkerRuntime:
     active_metrics = metrics or NullMetricRecorder()
+    active_max_receive_counts = dict(max_receive_counts or {})
+    active_retry_observers = dict(retry_exhaustion_observers or {})
     consumers = tuple(
         MessageConsumer(
             consumer_name=f"{queue_name}-worker",
@@ -654,6 +663,8 @@ def create_worker_runtime(
             metrics=active_metrics,
             task_protection=task_protection,
             delivery_observer=delivery_observer,
+            max_receive_count=active_max_receive_counts.get(queue_name),
+            retry_exhaustion_observer=active_retry_observers.get(queue_name),
         )
         for queue_name, queue in queues.items()
     )
@@ -856,6 +867,13 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
             metrics=metrics,
         ),
         delivery_observer=fault_guard,
+        max_receive_counts={
+            queue_name: queue_max_receive_count(queue_name, environment)
+            for queue_name in aws.queues
+        },
+        retry_exhaustion_observers={
+            "reporting": ReportGenerationFailureRecorder(lane_d.repository, clock)
+        },
     )
 
 

@@ -34,6 +34,7 @@ from interview_evidence.reporting.domain.deletion import (
     DeletionTarget,
     TargetStatus,
 )
+from interview_evidence.reporting.domain.failure import ReportGenerationFailure
 from interview_evidence.reporting.domain.report import (
     AssessmentState,
     AxisAssessment,
@@ -354,6 +355,25 @@ class ReportRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ReportGenerationFailureRow(Base):
+    __tablename__ = "report_generation_failures"
+    __table_args__ = (
+        Index(
+            "ix_report_generation_failures_session",
+            "company_id",
+            "interview_session_id",
+            "failed_at",
+        ),
+    )
+
+    company_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    source_event_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    interview_session_id: Mapped[UUID] = mapped_column(Uuid)
+    last_delivery_attempt: Mapped[int] = mapped_column(Integer)
+    error_code: Mapped[str] = mapped_column(String(100))
+    failed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ReportItemRow(Base):
     __tablename__ = "report_items"
     __table_args__ = (
@@ -516,7 +536,18 @@ class ReportingRepository(Protocol):
     def get_report_for_invitation(
         self, context: TenantContext, invitation_id: UUID
     ) -> Report | None: ...
+    def save_generation_failure(
+        self,
+        context: TenantContext,
+        failure: ReportGenerationFailure,
+    ) -> ReportGenerationFailure: ...
+    def get_generation_failure_for_session(
+        self,
+        context: TenantContext,
+        session_id: UUID,
+    ) -> ReportGenerationFailure | None: ...
     def save_review(self, context: TenantContext, review: HumanReview) -> HumanReview: ...
+    def get_review(self, context: TenantContext, review_id: UUID) -> HumanReview: ...
     def list_reviews(self, context: TenantContext, report_id: UUID) -> tuple[HumanReview, ...]: ...
     def save_deletion(
         self,
@@ -898,6 +929,63 @@ class SQLAlchemyReportingRepository:
     ) -> Report | None:
         return self._latest_report(context, ReportRow.invitation_id, invitation_id)
 
+    def save_generation_failure(
+        self,
+        context: TenantContext,
+        failure: ReportGenerationFailure,
+    ) -> ReportGenerationFailure:
+        context.assert_company(failure.company_id)
+        row = self._session.scalar(
+            select(ReportGenerationFailureRow).where(
+                ReportGenerationFailureRow.company_id == self._tenant(context),
+                ReportGenerationFailureRow.source_event_id == failure.source_event_id,
+            )
+        )
+        if row is None:
+            row = ReportGenerationFailureRow(
+                company_id=failure.company_id,
+                source_event_id=failure.source_event_id,
+                interview_session_id=failure.interview_session_id,
+                last_delivery_attempt=failure.last_delivery_attempt,
+                error_code=failure.error_code,
+                failed_at=failure.failed_at,
+            )
+            self._session.add(row)
+        else:
+            row.interview_session_id = failure.interview_session_id
+            row.last_delivery_attempt = max(
+                row.last_delivery_attempt,
+                failure.last_delivery_attempt,
+            )
+            row.error_code = failure.error_code
+            row.failed_at = failure.failed_at
+        self._session.flush()
+        return failure
+
+    def get_generation_failure_for_session(
+        self,
+        context: TenantContext,
+        session_id: UUID,
+    ) -> ReportGenerationFailure | None:
+        row = self._session.scalar(
+            select(ReportGenerationFailureRow)
+            .where(
+                ReportGenerationFailureRow.company_id == self._tenant(context),
+                ReportGenerationFailureRow.interview_session_id == session_id,
+            )
+            .order_by(ReportGenerationFailureRow.failed_at.desc())
+        )
+        if row is None:
+            return None
+        return ReportGenerationFailure(
+            company_id=row.company_id,
+            interview_session_id=row.interview_session_id,
+            source_event_id=row.source_event_id,
+            last_delivery_attempt=row.last_delivery_attempt,
+            error_code=row.error_code,
+            failed_at=_aware(row.failed_at),
+        )
+
     def save_review(self, context: TenantContext, review: HumanReview) -> HumanReview:
         context.assert_company(review.company_id)
         self.get_report(context, review.report_id)
@@ -916,6 +1004,27 @@ class SQLAlchemyReportingRepository:
         )
         self._session.flush()
         return review
+
+    def get_review(self, context: TenantContext, review_id: UUID) -> HumanReview:
+        row = self._session.scalar(
+            select(HumanReviewRow).where(
+                HumanReviewRow.company_id == self._tenant(context),
+                HumanReviewRow.human_review_id == review_id,
+            )
+        )
+        if row is None:
+            raise TenantScopedReportingNotFound("human review not found")
+        return HumanReview(
+            human_review_id=row.human_review_id,
+            company_id=row.company_id,
+            report_id=row.report_id,
+            company_user_id=row.company_user_id,
+            review_type=ReviewType(row.review_type),
+            target_id=row.target_id,
+            value=row.value,
+            reason=row.reason,
+            created_at=_aware(row.created_at),
+        )
 
     def list_reviews(self, context: TenantContext, report_id: UUID) -> tuple[HumanReview, ...]:
         self.get_report(context, report_id)

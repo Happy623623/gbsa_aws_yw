@@ -84,6 +84,13 @@ class FailingAdvanceBoundary:
             required_state=required_state,
         )
 
+    def get_recruiting_stage_decision(
+        self,
+        context: TenantContext,
+        invitation_id: UUID,
+    ):
+        return self._boundary.get_recruiting_stage_decision(context, invitation_id)
+
     def advance_invitation_state(
         self,
         _context: TenantContext,

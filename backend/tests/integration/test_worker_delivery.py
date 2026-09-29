@@ -194,6 +194,68 @@ def test_consumer_requeues_retryable_failure_without_recording_success() -> None
     )
 
 
+def test_consumer_persists_terminal_failure_only_on_configured_last_attempt() -> None:
+    queue = InMemoryQueue()
+    outbox = InMemoryOutbox()
+    event = _event().model_copy(
+        update={
+            "aggregate_type": "interview_session",
+            "aggregate_id": AGGREGATE_ID,
+            "event_type": "report.generation_requested",
+            "payload": {"interview_session_id": str(AGGREGATE_ID)},
+        }
+    )
+    outbox.append(event)
+    OutboxDispatcher(
+        outbox=outbox,
+        queues={"reporting": queue},
+        routing={"report.generation_requested": "reporting"},
+    ).dispatch_once()
+
+    # Put the same source delivery at attempt 3 without invoking a handler for attempts 1 and 2.
+    for _ in range(2):
+        delivery = queue.receive(max_messages=1)[0]
+        queue.retry(delivery.receipt_handle)
+
+    failures: list[tuple[UUID, int, str]] = []
+    operations: list[str] = []
+
+    class Observer:
+        def retry_exhausted(
+            self,
+            _context: TenantContext,
+            exhausted: OutboxEvent,
+            *,
+            error_code: str,
+        ) -> None:
+            failures.append(
+                (exhausted.outbox_event_id, exhausted.delivery_attempt or 0, error_code)
+            )
+            operations.append("failure")
+
+    consumer = MessageConsumer(
+        consumer_name="reporting-worker",
+        queue=queue,
+        processed=InMemoryProcessedMessageStore(),
+        handlers={
+            "report.generation_requested": lambda _context, _event: (_ for _ in ()).throw(
+                TimeoutError("sensitive dependency detail")
+            )
+        },
+        clock=FrozenClock(NOW),
+        max_receive_count=3,
+        retry_exhaustion_observer=Observer(),
+    )
+
+    assert consumer.consume_once(
+        max_messages=1,
+        rollback=lambda: operations.append("rollback"),
+        commit=lambda: operations.append("commit"),
+    ) == 0
+    assert failures == [(EVENT_ID, 3, "TimeoutError")]
+    assert operations == ["rollback", "failure", "commit"]
+
+
 def test_consumer_requeues_retrying_outcome_without_recording_success() -> None:
     retry_delays: list[int] = []
 

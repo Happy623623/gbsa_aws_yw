@@ -61,6 +61,8 @@ class DecisionWriter:
         self.fail_move = fail_move
         self.moves: list[tuple[UUID, UUID, int]] = []
         self.advances: list[CommandMeta] = []
+        self.state = "completed"
+        self.current_stage: StageDecision | None = None
 
     def move_to_recruiting_stage(
         self,
@@ -73,13 +75,23 @@ class DecisionWriter:
         if self.fail_move:
             raise ValueError("stale applicant pipeline version")
         self.moves.append((invitation_id, recruiting_stage_id, expected_pipeline_version))
-        return StageDecision(
+        self.current_stage = StageDecision(
             invitation_id=invitation_id,
             position_id=POSITION_ID,
             recruiting_stage_id=recruiting_stage_id,
             recruiting_stage_name="최종 합격",
             pipeline_row_version=expected_pipeline_version + 1,
         )
+        return self.current_stage
+
+    def get_recruiting_stage_decision(
+        self,
+        _context: TenantContext,
+        invitation_id: UUID,
+    ) -> StageDecision:
+        if self.current_stage is None or self.current_stage.invitation_id != invitation_id:
+            raise LookupError("recruiting stage decision not found")
+        return self.current_stage
 
     def authorize_invitation(
         self,
@@ -89,7 +101,7 @@ class DecisionWriter:
         required_state: str | frozenset[str],
     ) -> InvitationState:
         del required_state
-        return InvitationState(state="completed", row_version=4)
+        return InvitationState(state=self.state, row_version=4)
 
     def advance_invitation_state(
         self,
@@ -103,6 +115,7 @@ class DecisionWriter:
         assert from_state == "completed"
         assert to_state == "reviewed"
         self.advances.append(meta)
+        self.state = "reviewed"
         return InvitationState(state="reviewed", row_version=5)
 
 
@@ -291,6 +304,7 @@ def test_final_decision_moves_pipeline_and_records_dynamic_stage_audit() -> None
     assert review.value == {
         "recruiting_stage_id": str(STAGE_ID),
         "recruiting_stage_name": "최종 합격",
+        "expected_pipeline_version": "3",
     }
     assert review.reason is None
     projection = ReportingPublic(
@@ -355,6 +369,7 @@ def test_batch_final_stage_without_report_is_rejected_without_pipeline_write(
             target_stage_id=target_stage_id,
             moves=(ApplicantPipelineMove(INVITATION_ID, 1),),
             invitation_reviews=MissingReportResolver(),  # type: ignore[arg-type]
+            require_final_report=True,
         )
 
     assert repository.invitation.recruiting_stage_id == REVIEW_STAGE_ID

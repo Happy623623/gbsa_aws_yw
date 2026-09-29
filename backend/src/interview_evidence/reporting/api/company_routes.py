@@ -18,11 +18,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from interview_evidence.reporting.adapters.playback import ScopedPlaybackLocator
 from interview_evidence.reporting.application.deletion_service import DeletionService
+from interview_evidence.reporting.application.final_decision_service import (
+    FinalDecisionIdempotencyConflict,
+    FinalDecisionReportUnavailable,
+    FinalDecisionService,
+)
 from interview_evidence.reporting.application.review_service import (
     InvitationDecisionWriter,
     InvitationStateAdvancer,
     ReviewService,
-    close_invitation_review,
 )
 from interview_evidence.reporting.application.timeline_service import (
     QuestionRationaleProvider,
@@ -37,6 +41,10 @@ from interview_evidence.reporting.repositories.postgres import (
     TenantScopedReportingNotFound,
 )
 from interview_evidence.shared.audit import AuditAppender
+from interview_evidence.shared.idempotency import (
+    InMemoryResourceIdempotencyStore,
+    ResourceIdempotencyStore,
+)
 from interview_evidence.shared.ids import Clock
 from interview_evidence.shared.security.principals import (
     CompanyPrincipal,
@@ -340,12 +348,26 @@ def create_company_router(
     playback: ScopedPlaybackLocator,
     rationale_provider: QuestionRationaleProvider | None = None,
     invitations: InvitationDecisionWriter | InvitationStateAdvancer | None = None,
+    idempotency: ResourceIdempotencyStore | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/v1")
     reviews = ReviewService(repository)
     timeline = TimelineService(
         repository,
         rationale_provider=rationale_provider,
+    )
+    decision_service = (
+        FinalDecisionService(
+            repository=repository,
+            invitations=cast(InvitationDecisionWriter, invitations),
+            audit=audit,
+            clock=clock,
+            idempotency=idempotency or InMemoryResourceIdempotencyStore(),
+        )
+        if invitations is not None
+        and hasattr(invitations, "move_to_recruiting_stage")
+        and hasattr(invitations, "get_recruiting_stage_decision")
+        else None
     )
 
     def company_scope(
@@ -387,6 +409,19 @@ def create_company_router(
     ) -> dict[str, object]:
         report = repository.get_report_for_session(scope.context, session_id)
         if report is None:
+            failure = repository.get_generation_failure_for_session(
+                scope.context,
+                session_id,
+            )
+            if failure is not None:
+                return {
+                    "status": "failed",
+                    "retryable": False,
+                    "message": (
+                        "리포트 생성에 실패했습니다. 담당자가 재처리하기 전에는 "
+                        "최종 채용 결정을 진행할 수 없습니다."
+                    ),
+                }
             response.status_code = status.HTTP_202_ACCEPTED
             return {"status": "queued", "retryable": True, "message": None}
         audit.append(
@@ -581,9 +616,20 @@ def create_company_router(
         scope: Scope,
         idempotency_key: IdempotencyKey,
     ) -> dict[str, object] | JSONResponse:
-        del idempotency_key
-        report = repository.get_report_for_invitation(scope.context, invitation_id)
-        if report is None:
+        if decision_service is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="recruiting stage decision writer is unavailable",
+            )
+        try:
+            result = decision_service.record(
+                scope.context,
+                invitation_id=invitation_id,
+                recruiting_stage_id=body.recruiting_stage_id,
+                expected_pipeline_version=body.expected_pipeline_version,
+                idempotency_key=idempotency_key,
+            )
+        except FinalDecisionReportUnavailable:
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content={
@@ -591,20 +637,11 @@ def create_company_router(
                     "detail": "Final report is not available.",
                 },
             )
-        if invitations is None or not hasattr(invitations, "move_to_recruiting_stage"):
+        except FinalDecisionIdempotencyConflict as error:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="recruiting stage decision writer is unavailable",
-            )
-        occurred_at = clock.now()
-        decision_writer = cast(InvitationDecisionWriter, invitations)
-        try:
-            stage = decision_writer.move_to_recruiting_stage(
-                scope.context,
-                invitation_id,
-                recruiting_stage_id=body.recruiting_stage_id,
-                expected_pipeline_version=body.expected_pipeline_version,
-            )
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency-Key was already used for another final decision.",
+            ) from error
         except ValueError as error:
             # The one-applicant move validates its stage and optimistic-lock version before
             # persisting. A stale report therefore remains a conflict with no partial write.
@@ -612,43 +649,14 @@ def create_company_router(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=str(error),
             ) from error
-        review = reviews.record_recruiting_stage_decision(
-            scope.context,
-            report_id=report.report_id,
-            invitation_id=invitation_id,
-            recruiting_stage_id=stage.recruiting_stage_id,
-            recruiting_stage_name=stage.recruiting_stage_name,
-            occurred_at=occurred_at,
-        )
-        # Do not translate failures after the pipeline write to a 4xx response: the shared
-        # request middleware rolls back on an exception/5xx, keeping these three writes atomic.
-        invitation_state = close_invitation_review(
-            decision_writer,
-            scope.context,
-            invitation_id=invitation_id,
-            occurred_at=occurred_at,
-        )
-        audit.append(
-            scope.context,
-            action="final_decision.create",
-            resource_type="human_review",
-            resource_id=review.human_review_id,
-            result="created",
-            metadata={
-                "invitation_id": str(invitation_id),
-                "recruiting_stage_id": str(stage.recruiting_stage_id),
-                "recruiting_stage_name": stage.recruiting_stage_name,
-                "invitation_state": invitation_state or "unchanged",
-            },
-        )
         return {
-            "human_review": _review_view(review),
-            "invitation_id": stage.invitation_id,
-            "position_id": stage.position_id,
-            "recruiting_stage_id": stage.recruiting_stage_id,
-            "recruiting_stage_name": stage.recruiting_stage_name,
-            "pipeline_row_version": stage.pipeline_row_version,
-            "invitation_state": invitation_state,
+            "human_review": _review_view(result.review),
+            "invitation_id": result.stage.invitation_id,
+            "position_id": result.stage.position_id,
+            "recruiting_stage_id": result.stage.recruiting_stage_id,
+            "recruiting_stage_name": result.stage.recruiting_stage_name,
+            "pipeline_row_version": result.stage.pipeline_row_version,
+            "invitation_state": result.invitation_state,
         }
 
     @router.post(
@@ -726,7 +734,8 @@ def create_lane_d_runtime(
     clock: Clock,
     deletion_service: DeletionService | None = None,
     rationale_provider: QuestionRationaleProvider | None = None,
-    invitations: InvitationStateAdvancer | None = None,
+    invitations: InvitationDecisionWriter | InvitationStateAdvancer | None = None,
+    idempotency: ResourceIdempotencyStore | None = None,
 ) -> LaneDRuntime:
     active_repository = repository
     app = FastAPI(title="Interview Evidence Reporting")
@@ -749,6 +758,7 @@ def create_lane_d_runtime(
             playback=ScopedPlaybackLocator(),
             rationale_provider=rationale_provider,
             invitations=invitations,
+            idempotency=idempotency,
         )
     )
     return LaneDRuntime(
@@ -765,6 +775,7 @@ def create_lane_d_app(
     audit: AuditAppender,
     clock: Clock,
     rationale_provider: QuestionRationaleProvider | None = None,
+    idempotency: ResourceIdempotencyStore | None = None,
 ) -> FastAPI:
     return create_lane_d_runtime(
         principal_provider=principal_provider,
@@ -772,4 +783,5 @@ def create_lane_d_app(
         audit=audit,
         clock=clock,
         rationale_provider=rationale_provider,
+        idempotency=idempotency,
     ).app

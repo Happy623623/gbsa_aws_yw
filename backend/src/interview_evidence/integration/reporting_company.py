@@ -125,6 +125,25 @@ class ReportingHiringBoundary:
             pipeline_row_version=moved.pipeline_row_version,
         )
 
+    def get_recruiting_stage_decision(
+        self,
+        context: TenantContext,
+        invitation_id: UUID,
+    ) -> RecruitingStageDecisionProjection:
+        current = self._hiring.get_applicant_recruiting_state(context, invitation_id)
+        stage = next(
+            candidate
+            for candidate in current.stages
+            if candidate.recruiting_stage_id == current.invitation.recruiting_stage_id
+        )
+        return RecruitingStageDecisionProjection(
+            invitation_id=current.invitation.invitation_id,
+            position_id=current.invitation.position_id,
+            recruiting_stage_id=stage.recruiting_stage_id,
+            recruiting_stage_name=stage.name,
+            pipeline_row_version=current.invitation.pipeline_row_version,
+        )
+
 
 class ReportingCompanyBoundary:
     """Adapt Lane D's public projections for company-facing read models."""

@@ -301,6 +301,7 @@ class HiringService:
         target_stage_id: UUID,
         moves: tuple[ApplicantPipelineMove, ...],
         invitation_reviews: InvitationReviewResolver | None = None,
+        require_final_report: bool = False,
     ) -> tuple[Invitation, ...]:
         if not moves or len(moves) > 1000:
             raise ValueError("between 1 and 1000 applicants must be moved")
@@ -317,7 +318,7 @@ class HiringService:
             )
             if invitation.position_id != position_id:
                 raise ValueError("applicant does not belong to the selected position")
-            if final_stage:
+            if final_stage and require_final_report:
                 review = (
                     invitation_reviews.get_invitation_review(
                         context,

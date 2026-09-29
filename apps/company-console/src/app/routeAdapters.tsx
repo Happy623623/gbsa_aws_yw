@@ -971,6 +971,12 @@ type PendingReportResponse = Readonly<{
   message: string | null;
 }>;
 
+type FailedReportResponse = Readonly<{
+  status: "failed";
+  retryable: false;
+  message: string;
+}>;
+
 type TimelineResponse = components["schemas"]["TimelineView"];
 
 type FinalDecisionResponse = components["schemas"]["FinalDecisionView"];
@@ -1077,6 +1083,7 @@ export function ReviewRoute() {
     useState<CompanyApplicantRecruitingState | null>(null);
   const [reportPending, setReportPending] = useState(false);
   const [reportDelayed, setReportDelayed] = useState(false);
+  const [reportFailure, setReportFailure] = useState<string | null>(null);
   const [error, setError] = useState(false);
   const authenticated =
     !AUTH_CONFIG || Boolean(getCompanyAccessToken(localStorage));
@@ -1104,7 +1111,7 @@ export function ReviewRoute() {
     async function loadReview() {
       try {
         const [nextReport, nextTimeline] = await Promise.all([
-          companyRequest<ReportResponse | PendingReportResponse>(
+          companyRequest<ReportResponse | PendingReportResponse | FailedReportResponse>(
             `/v1/interview-sessions/${sessionId}/report`,
           ),
           companyRequest<TimelineResponse>(
@@ -1112,15 +1119,27 @@ export function ReviewRoute() {
           ),
         ]);
         if (!active) return;
+        if (isFailedReport(nextReport)) {
+          setReport(null);
+          setTimeline(nextTimeline);
+          setReportPending(false);
+          setReportDelayed(false);
+          setReportFailure(nextReport.message);
+          setError(false);
+          if (delayTimer !== undefined) window.clearTimeout(delayTimer);
+          return;
+        }
         if (!isPendingReport(nextReport)) {
           setReport(nextReport);
           setTimeline(nextTimeline);
           setReportPending(false);
           setReportDelayed(false);
+          setReportFailure(null);
           setError(false);
           if (delayTimer !== undefined) window.clearTimeout(delayTimer);
           return;
         }
+        setReportFailure(null);
         setReportPending(true);
         scheduleDelayWarning();
         retryTimer = window.setTimeout(() => void loadReview(), 2000);
@@ -1134,6 +1153,7 @@ export function ReviewRoute() {
         }
         setReportPending(false);
         setReportDelayed(false);
+        setReportFailure(null);
         setError(true);
       }
     }
@@ -1281,9 +1301,11 @@ export function ReviewRoute() {
           </header>
           <div
             className={ASYNC_STATE}
-            role={error || reportDelayed ? "alert" : "status"}
+            role={error || reportDelayed || reportFailure ? "alert" : "status"}
             data-report-state={
-              error
+              reportFailure
+                ? "failed"
+                : error
                 ? "error"
                 : reportDelayed
                   ? "delayed"
@@ -1293,7 +1315,9 @@ export function ReviewRoute() {
             }
           >
             <p className="text-[12px]">
-              {error
+              {reportFailure
+                ? reportFailure
+                : error
                 ? "리포트를 불러올 수 없습니다. 잠시 후 다시 시도해 주세요."
                 : reportDelayed
                   ? "최종 리포트 생성이 지연되고 있습니다. 리포트가 준비될 때까지 최종 채용 결정을 확정할 수 없습니다."
@@ -1318,11 +1342,17 @@ export function ReviewRoute() {
 }
 
 function isPendingReport(
-  report: ReportResponse | PendingReportResponse,
+  report: ReportResponse | PendingReportResponse | FailedReportResponse,
 ): report is PendingReportResponse {
   return (
     "retryable" in report && report.status === "queued" && report.retryable
   );
+}
+
+function isFailedReport(
+  report: ReportResponse | PendingReportResponse | FailedReportResponse,
+): report is FailedReportResponse {
+  return "retryable" in report && report.status === "failed" && !report.retryable;
 }
 
 export function CompanyLoginRoute() {

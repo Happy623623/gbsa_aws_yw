@@ -358,6 +358,7 @@ def create_production_runtime(
         repository=create_reporting_repository(session),
         audit=audit,
         clock=clock,
+        idempotency=resource_idempotency,
     )
     assistant_documents = SQLAlchemyAssistantDocumentRepository(session)
     assistant_projector = ReportSearchProjector(assistant_documents, embedder)
@@ -401,6 +402,7 @@ def create_production_runtime(
         deletion_service=deletion_service,
         rationale_provider=interview_public,
         invitations=reporting_hiring,
+        idempotency=resource_idempotency,
     )
     media_processor = MediaPostProcessor(lane_d.repository)
     interview_reporting = InterviewReportingBoundary(

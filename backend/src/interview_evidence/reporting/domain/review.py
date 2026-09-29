@@ -131,6 +131,7 @@ class HumanReview:
         actor_type: ActorType,
         recruiting_stage_id: UUID,
         recruiting_stage_name: str,
+        expected_pipeline_version: int,
         created_at: datetime,
     ) -> HumanReview:
         if actor_type is not ActorType.COMPANY_USER:
@@ -148,6 +149,7 @@ class HumanReview:
             value={
                 "recruiting_stage_id": str(recruiting_stage_id),
                 "recruiting_stage_name": normalized_name,
+                "expected_pipeline_version": str(expected_pipeline_version),
             },
             reason=None,
             created_at=created_at,

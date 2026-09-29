@@ -82,6 +82,12 @@ class InvitationDecisionWriter(InvitationStateAdvancer, Protocol):
         expected_pipeline_version: int,
     ) -> RecruitingStageDecision: ...
 
+    def get_recruiting_stage_decision(
+        self,
+        context: TenantContext,
+        invitation_id: UUID,
+    ) -> RecruitingStageDecision: ...
+
 
 def close_invitation_review(
     invitations: InvitationStateAdvancer,
@@ -243,6 +249,7 @@ class ReviewService:
         invitation_id: UUID,
         recruiting_stage_id: UUID,
         recruiting_stage_name: str,
+        expected_pipeline_version: int,
         occurred_at: datetime,
     ) -> HumanReview:
         self._repository.get_report(context, report_id)
@@ -255,6 +262,7 @@ class ReviewService:
             actor_type=context.actor_type,
             recruiting_stage_id=recruiting_stage_id,
             recruiting_stage_name=recruiting_stage_name,
+            expected_pipeline_version=expected_pipeline_version,
             created_at=occurred_at,
         )
         return self._repository.save_review(context, review)

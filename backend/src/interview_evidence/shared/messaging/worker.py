@@ -87,6 +87,18 @@ class NullDeliveryLifecycleObserver:
         return None
 
 
+class RetryExhaustionObserver(Protocol):
+    """Persist a sanitized terminal fact after the last source processing attempt."""
+
+    def retry_exhausted(
+        self,
+        context: TenantContext,
+        event: OutboxEvent,
+        *,
+        error_code: str,
+    ) -> None: ...
+
+
 class InMemoryProcessedMessageStore:
     def __init__(self) -> None:
         self._messages: dict[tuple[str, UUID, int], ProcessedMessage] = {}
@@ -190,7 +202,11 @@ class MessageConsumer:
         metrics: MetricRecorder | None = None,
         task_protection: TaskProtection | None = None,
         delivery_observer: DeliveryLifecycleObserver | None = None,
+        max_receive_count: int | None = None,
+        retry_exhaustion_observer: RetryExhaustionObserver | None = None,
     ) -> None:
+        if max_receive_count is not None and max_receive_count < 1:
+            raise ValueError("max receive count must be positive")
         self._consumer_name = consumer_name
         self._queue = queue
         self._processed = processed
@@ -200,6 +216,8 @@ class MessageConsumer:
         self._metrics = metrics or NullMetricRecorder()
         self._task_protection = task_protection or NullTaskProtection()
         self._delivery_observer = delivery_observer or NullDeliveryLifecycleObserver()
+        self._max_receive_count = max_receive_count
+        self._retry_exhaustion_observer = retry_exhaustion_observer
 
     def consume_once(
         self,
@@ -266,8 +284,23 @@ class MessageConsumer:
                     self._task_protection.release(delivery.event_id)
                 if _requests_retry(outcome):
                     raise MessageRetryRequested("handler requested retry")
-            except (MessageRetryRequested, TimeoutError, ConnectionError):
+            except (MessageRetryRequested, TimeoutError, ConnectionError) as error:
                 rollback_transaction()
+                if (
+                    self._retry_exhaustion_observer is not None
+                    and self._max_receive_count is not None
+                    and delivery.receive_count >= self._max_receive_count
+                ):
+                    try:
+                        self._retry_exhaustion_observer.retry_exhausted(
+                            context,
+                            event,
+                            error_code=type(error).__name__,
+                        )
+                        commit_transaction()
+                    except BaseException:
+                        rollback_transaction()
+                        raise
                 self._record_latency(delivery.event_type, delivery.event_version, started_at)
                 self._record_delivery("retrying")
                 self._queue.retry(

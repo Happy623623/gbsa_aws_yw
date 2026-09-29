@@ -464,4 +464,58 @@ describe("ReviewRoute", () => {
       vi.useRealTimers();
     }
   });
+
+  it("shows terminal report failure and stops polling", async () => {
+    vi.useFakeTimers();
+    try {
+      let reportRequests = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((input: RequestInfo | URL) => {
+          const url = String(input);
+          const body = url.endsWith("/timeline")
+            ? TIMELINE_PAYLOAD
+            : url.endsWith("/recruiting-state")
+              ? {
+                  invitation_id: INVITATION_ID,
+                  position_id: "00000000-0000-7000-8000-000000000006",
+                  recruiting_stage_id: "00000000-0000-7000-8000-000000000007",
+                  pipeline_row_version: 1,
+                  stages: [],
+                }
+              : {
+                  status: "failed",
+                  retryable: false,
+                  message:
+                    "리포트 생성에 실패했습니다. 담당자가 재처리하기 전에는 최종 채용 결정을 진행할 수 없습니다.",
+                };
+          if (url.endsWith("/report")) reportRequests += 1;
+          return Promise.resolve(
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }),
+      );
+
+      renderReview();
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const failure = screen.getByRole("alert");
+      expect(failure.getAttribute("data-report-state")).toBe("failed");
+      expect(failure.textContent).toContain("리포트 생성에 실패했습니다");
+      expect(failure.textContent).toContain("최종 채용 결정을 진행할 수 없습니다");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(reportRequests).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
