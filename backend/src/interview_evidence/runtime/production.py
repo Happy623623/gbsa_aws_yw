@@ -106,6 +106,10 @@ from interview_evidence.reporting.application.requirement_assessment import (
     RequirementAssessor,
 )
 from interview_evidence.reporting.application.transcript_service import TranscriptService
+from interview_evidence.runtime.controlproof_consent import (
+    ControlProofConsentFaultGuard,
+    ControlProofProcessingObserver,
+)
 from interview_evidence.runtime.controlproof_model_substitute import (
     controlproof_health,
     validate_controlproof_test_controls,
@@ -200,6 +204,10 @@ def create_production_runtime(
     text_to_speech: TextToSpeech | None = None,
 ) -> Runtime:
     validate_controlproof_test_controls(environment)
+    # Constructing these disabled-by-default controls validates the local/test boundary.
+    # Product consent enforcement is intentionally not changed before the first N-02 Run.
+    consent_fault_guard = ControlProofConsentFaultGuard.from_environment(environment)
+    processing_observer = ControlProofProcessingObserver.from_environment(environment)
     streaming_speech = create_speech_runtime_dependencies(environment)
     email_sender = email_sender or create_local_email_sender(environment)
     applicant_access_base_url = _applicant_access_base_url(environment)
@@ -270,6 +278,7 @@ def create_production_runtime(
         email_sender=email_sender,
         applicant_access_base_url=applicant_access_base_url,
         logo_base_url=logo_base_url,
+        consent_fault_boundary=consent_fault_guard,
     )
 
     class RuntimePrincipalProvider:
@@ -343,6 +352,7 @@ def create_production_runtime(
             ),
         ),
         allow_automated_answers=_automated_interviews_enabled(environment),
+        processing_observer=processing_observer,
     )
     interview_public = InterviewEnginePublic(
         repository=lane_c.repository,

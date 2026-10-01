@@ -37,19 +37,45 @@ class InvitationAnalysisFinalizer(Protocol):
     ) -> bool: ...
 
 
+class ProcessingObserver(Protocol):
+    def record(
+        self,
+        *,
+        trace_id: str,
+        path_id: str,
+        boundary: str,
+        subject_ref: str = "",
+        request_or_event_id: str = "",
+    ) -> bool: ...
+
+
 class AnalysisRequestedEventHandler:
     def __init__(
         self,
         runtime: LaneBRuntime,
         handler: AnalysisJobHandler,
         company: CompanyManagementPublic | None = None,
+        processing_observer: ProcessingObserver | None = None,
     ) -> None:
         self._runtime = runtime
         self._handler = handler
         self._company = company
+        self._processing_observer = processing_observer
 
     def __call__(self, context: TenantContext, event: OutboxEvent) -> object:
         submission_id = UUID(str(event.payload["submission_id"]))
+        if self._processing_observer is not None:
+            try:
+                parts = event.trace_id.split(":", 3)
+                self._processing_observer.record(
+                    trace_id=event.trace_id,
+                    path_id="DOCUMENT_ANALYSIS",
+                    boundary="ANALYSIS_HANDLER_ENTERED",
+                    subject_ref=parts[3] if len(parts) == 4 else "",
+                    request_or_event_id=str(event.outbox_event_id),
+                )
+            except Exception:  # noqa: BLE001 - observer cannot fail analysis
+                pass
         submission = self._runtime.repository.get_submission(context, submission_id)
         if self._company is not None and _owns_analysis_state_transition(
             submission,

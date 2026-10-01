@@ -9,6 +9,15 @@ x-controlproof-test-controls: &controlproof-test-controls
   CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED: ${CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED:-false}
   CONTROLPROOF_MODEL_FIXTURE_ID: ${CONTROLPROOF_MODEL_FIXTURE_ID:-h03-report-v1}
   CONTROLPROOF_FAULT_ROOT: ${CONTROLPROOF_FAULT_ROOT:-.controlproof/faults}
+  CONTROLPROOF_OBSERVER_ENABLED: ${CONTROLPROOF_OBSERVER_ENABLED:-false}
+  CONTROLPROOF_OBSERVER_ROOT: ${CONTROLPROOF_OBSERVER_ROOT:-.controlproof/observers}
+  CONTROLPROOF_EXTERNAL_AI_ALLOWED: ${CONTROLPROOF_EXTERNAL_AI_ALLOWED:-false}
+
+# Bounded host paths used if the API/worker is later containerized. No public fault
+# endpoint or broad workspace mount is exposed.
+x-controlproof-test-mounts: &controlproof-test-mounts
+  - ${CONTROLPROOF_FAULT_ROOT:-.controlproof/faults}:/var/run/controlproof/faults
+  - ${CONTROLPROOF_OBSERVER_ROOT:-.controlproof/observers}:/var/run/controlproof/observers
 
 # Local infrastructure only -- Postgres, LocalStack and Mailpit. The API and worker are
 # here: they run on the host with `make api` / `make worker`, against the production runtime

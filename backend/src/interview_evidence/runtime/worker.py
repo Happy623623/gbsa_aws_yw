@@ -40,6 +40,10 @@ from interview_evidence.reporting.application.requirement_assessment import (
     RequirementEvidenceCandidate,
 )
 from interview_evidence.reporting.domain.timeline import TranscriptSegment
+from interview_evidence.runtime.controlproof_consent import (
+    ControlProofConsentFaultGuard,
+    ControlProofProcessingObserver,
+)
 from interview_evidence.runtime.controlproof_faults import ControlProofReportingFaultGuard
 from interview_evidence.runtime.controlproof_model_substitute import (
     resolve_controlproof_embedder,
@@ -330,6 +334,7 @@ class ReportRequestedEventHandler:
         submission: SubmissionAnalysisPublic | None = None,
         embedder: TextEmbedder | None = None,
         controlproof_fault_guard: ControlProofReportingFaultGuard | None = None,
+        processing_observer: ControlProofProcessingObserver | None = None,
     ) -> None:
         self._company = company
         self._interview = interview
@@ -340,9 +345,22 @@ class ReportRequestedEventHandler:
         self._submission = submission
         self._embedder = embedder
         self._controlproof_fault_guard = controlproof_fault_guard
+        self._processing_observer = processing_observer
 
     def __call__(self, context: TenantContext, event: OutboxEvent) -> object:
         session_id = UUID(str(event.payload["interview_session_id"]))
+        if self._processing_observer is not None:
+            try:
+                parts = event.trace_id.split(":", 3)
+                self._processing_observer.record(
+                    trace_id=event.trace_id,
+                    path_id="AI_ASSESSMENT",
+                    boundary="REPORT_HANDLER_ENTERED",
+                    subject_ref=parts[3] if len(parts) == 4 else "",
+                    request_or_event_id=str(event.outbox_event_id),
+                )
+            except Exception:  # noqa: BLE001 - observer cannot fail report generation
+                pass
         if self._controlproof_fault_guard is not None:
             # This must remain before every report read/write or external model call.
             self._controlproof_fault_guard.before_report_side_effect(event)
@@ -685,6 +703,8 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
     from interview_evidence.runtime.production import create_production_runtime
 
     validate_controlproof_test_controls(environment)
+    ControlProofConsentFaultGuard.from_environment(environment)
+    processing_observer = ControlProofProcessingObserver.from_environment(environment)
     fault_guard = ControlProofReportingFaultGuard.from_environment(environment)
     aws = create_aws_runtime_dependencies(environment)
     report_model = resolve_controlproof_model(environment, aws.model)
@@ -807,6 +827,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
                 lane_b,
                 analysis_handler,
                 company,
+                processing_observer,
             ),
             "submission.analysis_completed": AnalysisCompletedEventHandler(
                 lane_b,
@@ -846,6 +867,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
                 submission=submission,
                 embedder=aws.embedder,
                 controlproof_fault_guard=fault_guard,
+                processing_observer=processing_observer,
             ),
             "deletion.requested": DeletionRequestedEventHandler(
                 deletion_service,

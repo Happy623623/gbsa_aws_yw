@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
 from uuid import UUID
 
 from interview_evidence.company_management.domain.applicant_access import (
@@ -36,6 +37,19 @@ class ApplicantInvitationPreviewSnapshot:
     submission_requirements: tuple[SubmissionRequirement, ...]
 
 
+class ConsentFaultBoundary(Protocol):
+    """Optional local/test boundary; production authorization remains unchanged."""
+
+    def trigger_if_configured(
+        self,
+        *,
+        invitation_id: str,
+        applicant_id: str,
+        request_id: str,
+        trace_id: str,
+    ) -> bool: ...
+
+
 class ApplicantAccessService:
     def __init__(
         self,
@@ -44,11 +58,13 @@ class ApplicantAccessService:
         clock: Clock,
         *,
         consent_policy: ConsentPolicy = DEFAULT_CONSENT_POLICY,
+        consent_fault_boundary: ConsentFaultBoundary | None = None,
     ) -> None:
         self._repository = repository
         self._outbox = outbox
         self._clock = clock
         self._consent_policy = consent_policy
+        self._consent_fault_boundary = consent_fault_boundary
 
     def get_consent_policy(self) -> ConsentPolicy:
         return self._consent_policy
@@ -147,6 +163,13 @@ class ApplicantAccessService:
             expected_version=invitation.row_version,
         )
         self._repository.save_consent(context, consent)
+        if self._consent_fault_boundary is not None:
+            self._consent_fault_boundary.trigger_if_configured(
+                invitation_id=str(principal.invitation_id),
+                applicant_id=str(principal.applicant_id),
+                request_id=str(context.request_id),
+                trace_id=context.trace_id,
+            )
         self._save_transition(context, invitation, updated)
         self._outbox.append(
             OutboxEvent(

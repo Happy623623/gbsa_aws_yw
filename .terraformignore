@@ -5,7 +5,14 @@
 *.tfstate.*
 *.tfvars
 *.tfplan
-.env*
+tfplan
+.env
+.env.*
+*.pem
+*.key
 node_modules/
 .venv/
 __pycache__/
+coverage/
+dist/
+build/

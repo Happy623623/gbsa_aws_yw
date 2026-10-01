@@ -17,6 +17,7 @@ from interview_evidence.company_management.api.company_routes import (
 )
 from interview_evidence.company_management.application.applicant_access_service import (
     ApplicantAccessService,
+    ConsentFaultBoundary,
 )
 from interview_evidence.company_management.application.company_service import CompanyService
 from interview_evidence.company_management.application.criteria_service import CriteriaService
@@ -73,6 +74,7 @@ def create_lane_a_runtime(
     logo_base_url: str = "https://console.local",
     interview_sessions: InvitationSessionResolver | None = None,
     invitation_reviews: InvitationReviewResolver | None = None,
+    consent_fault_boundary: ConsentFaultBoundary | None = None,
 ) -> LaneARuntime:
     active_repository = repository
     active_audit = audit
@@ -108,6 +110,7 @@ def create_lane_a_runtime(
         active_repository,
         active_outbox,
         active_clock,
+        consent_fault_boundary=consent_fault_boundary,
     )
     template_service = InvitationTemplateService(
         active_repository,
@@ -162,6 +165,7 @@ def create_lane_a_app(
     logo_base_url: str = "https://console.local",
     interview_sessions: InvitationSessionResolver | None = None,
     invitation_reviews: InvitationReviewResolver | None = None,
+    consent_fault_boundary: ConsentFaultBoundary | None = None,
 ) -> FastAPI:
     return create_lane_a_runtime(
         principal_provider=principal_provider,
@@ -176,6 +180,7 @@ def create_lane_a_app(
         logo_base_url=logo_base_url,
         interview_sessions=interview_sessions,
         invitation_reviews=invitation_reviews,
+        consent_fault_boundary=consent_fault_boundary,
     ).app
 
 

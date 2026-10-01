@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -50,6 +51,18 @@ class ResumeSnapshot(BaseModel):
     degraded_modes: tuple[str, ...]
 
 
+class ProcessingObserverPort(Protocol):
+    def record(
+        self,
+        *,
+        trace_id: str,
+        path_id: str,
+        boundary: str,
+        subject_ref: str = "",
+        request_or_event_id: str = "",
+    ) -> bool: ...
+
+
 class SessionApplicationService:
     def __init__(
         self,
@@ -61,6 +74,7 @@ class SessionApplicationService:
         reconciler: ContextReconciler,
         recording: RecordingService,
         clock: Clock,
+        processing_observer: ProcessingObserverPort | None = None,
     ) -> None:
         self._repository = repository
         self._authorization = authorization
@@ -69,6 +83,7 @@ class SessionApplicationService:
         self._reconciler = reconciler
         self._recording = recording
         self._clock = clock
+        self._processing_observer = processing_observer
         self._state_machine = SessionStateMachine()
 
     def record_equipment_check(
@@ -207,6 +222,12 @@ class SessionApplicationService:
             hot_view_sync_status=HotViewSyncStatus.PENDING,
             occurred_at=self._clock.now(),
         )
+        self._observe(
+            context,
+            path_id="RECORDING",
+            boundary="INTERVIEW_SESSION_CREATED",
+            request_or_event_id=str(session.interview_session_id),
+        )
         return session
 
     def resume(
@@ -303,6 +324,12 @@ class SessionApplicationService:
             hot_view_sync_status=HotViewSyncStatus.PENDING,
             occurred_at=self._clock.now(),
         )
+        self._observe(
+            context,
+            path_id="RECORDING",
+            boundary="INTERVIEW_SESSION_STARTED",
+            request_or_event_id=str(started.interview_session_id),
+        )
         return started
 
     def repeat_question(
@@ -374,10 +401,39 @@ class SessionApplicationService:
         depend on there being at least one chunk.
         """
         self._authorized_session(context, principal, session_id)
-        return self._recording.verify_uploaded_chunk(context, intent=intent)
+        chunk = self._recording.verify_uploaded_chunk(context, intent=intent)
+        self._observe(
+            context,
+            path_id="RECORDING",
+            boundary="RECORDING_CONFIRMED",
+            request_or_event_id=str(chunk.recording_chunk_id),
+        )
+        return chunk
 
     def upload_intent_expires_at(self) -> datetime:
         return self._clock.now() + timedelta(minutes=15)
+
+    def _observe(
+        self,
+        context: TenantContext,
+        *,
+        path_id: str,
+        boundary: str,
+        request_or_event_id: str,
+    ) -> None:
+        if self._processing_observer is None:
+            return
+        try:
+            parts = context.trace_id.split(":", 3)
+            self._processing_observer.record(
+                trace_id=context.trace_id,
+                path_id=path_id,
+                boundary=boundary,
+                subject_ref=parts[3] if len(parts) == 4 else "",
+                request_or_event_id=request_or_event_id,
+            )
+        except Exception:  # noqa: BLE001 - observability cannot fail product processing
+            return
 
     def _authorized_session(
         self,

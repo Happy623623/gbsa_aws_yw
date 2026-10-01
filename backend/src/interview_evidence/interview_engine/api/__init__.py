@@ -46,6 +46,7 @@ from interview_evidence.interview_engine.application.recording_service import (
 )
 from interview_evidence.interview_engine.application.recovery_service import RecoveryService
 from interview_evidence.interview_engine.application.session_service import (
+    ProcessingObserverPort,
     SessionApplicationService,
 )
 from interview_evidence.interview_engine.repositories.postgres import (
@@ -98,6 +99,7 @@ def create_lane_c_runtime(
     text_to_speech: TextToSpeech | None = None,
     websocket_speech: WebSocketSpeechRuntime | None = None,
     allow_automated_answers: bool = False,
+    processing_observer: ProcessingObserverPort | None = None,
 ) -> LaneCRuntime:
     active_repository = repository
     active_storage = object_storage
@@ -125,6 +127,7 @@ def create_lane_c_runtime(
             verifier=StorageRecordingVerifier(cast(VerifiableObjectStorage, active_storage)),
         ),
         clock=active_clock,
+        processing_observer=processing_observer,
     )
     stream_handler = ProtocolStreamHandler(session_service=service)
     core_live_dependencies = (
