@@ -1,0 +1,33 @@
+{
+  "applicant_id": "a0451c2e-3e36-5de1-8494-2956a9779d05",
+  "captured_at": "2026-10-02T07:46:33.040068+00:00",
+  "fault_files_exist": {
+    "consumed_token": false,
+    "fault_receipt": false,
+    "marker": false
+  },
+  "findings": {
+    "active_consents": 0,
+    "all_invitation_events": 0,
+    "analyses": 0,
+    "consent_completed_events": 0,
+    "consent_records": 0,
+    "consented_transitions": 0,
+    "interview_strategies": 0,
+    "invitation": [
+      [
+        "identity_verified",
+        1
+      ]
+    ],
+    "submissions": 0,
+    "upload_intents": 0
+  },
+  "invitation_id": "3a69ee4e-5970-5ced-83d9-26a70714127d",
+  "lane_subject_ref": "n02-15cef078-consent-fault-recovery",
+  "parent_run_id": "15cef078-ee24-4f0e-91ef-381e0f7a1cc2",
+  "safe_state_read_only": true,
+  "schema_version": "controlproof.n02-cleanup-evidence.v1",
+  "subject_ref": "n02-consent-order",
+  "target_id": "whyyou-local"
+}
