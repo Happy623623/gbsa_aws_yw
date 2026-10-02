@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -46,6 +50,7 @@ from interview_evidence.runtime.controlproof_consent import (
 )
 from interview_evidence.runtime.controlproof_faults import ControlProofReportingFaultGuard
 from interview_evidence.runtime.controlproof_model_substitute import (
+    controlproof_ai_isolation_digest,
     resolve_controlproof_embedder,
     resolve_controlproof_model,
     validate_controlproof_test_controls,
@@ -135,14 +140,48 @@ class WorkerRuntime:
     dispatcher: OutboxDispatcher
     consumers: tuple[MessageConsumer, ...]
     database: RequestScopedDatabase | None = None
+    controlproof_attestation: tuple[Path, str, str, int, int] | None = None
 
     def run_once(self) -> int:
         if self.database is None:
-            return self._run_without_transaction()
-        completed = self._run_in_transaction(self.dispatcher.dispatch_once)
-        for consumer in self.consumers:
-            completed += self._run_consumer(consumer)
+            completed = self._run_without_transaction()
+        else:
+            completed = self._run_in_transaction(self.dispatcher.dispatch_once)
+            for consumer in self.consumers:
+                completed += self._run_consumer(consumer)
+        self._attest_controlproof_worker()
         return completed
+
+    def _attest_controlproof_worker(self) -> None:
+        if self.controlproof_attestation is None:
+            return
+        root, session_id, isolation_digest, launcher_pid, slot = self.controlproof_attestation
+        directory = root / "worker-attestations"
+        directory.mkdir(parents=True, exist_ok=True)
+        pid = os.getpid()
+        path = directory / f"{session_id}-{pid}.json"
+        temporary = directory / f".{session_id}-{pid}.tmp"
+        payload = {
+            "schema_version": "controlproof.n02-worker-attestation.v1",
+            "session_id": session_id,
+            "launcher_pid": launcher_pid,
+            "worker_pid": pid,
+            "worker_slot": slot,
+            "ai_isolation_digest": isolation_digest,
+            "heartbeat_at": datetime.now(UTC).isoformat(),
+        }
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        for attempt in range(20):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 19:
+                    raise
+                time.sleep(0.05)
 
     def _run_consumer(self, consumer: MessageConsumer) -> int:
         if self.database is None:
@@ -364,6 +403,18 @@ class ReportRequestedEventHandler:
         if self._controlproof_fault_guard is not None:
             # This must remain before every report read/write or external model call.
             self._controlproof_fault_guard.before_report_side_effect(event)
+        if self._processing_observer is not None:
+            try:
+                parts = event.trace_id.split(":", 3)
+                self._processing_observer.record(
+                    trace_id=event.trace_id,
+                    path_id="AI_ASSESSMENT",
+                    boundary="REPORT_ASSESSMENT_STARTED",
+                    subject_ref=parts[3] if len(parts) == 4 else "",
+                    request_or_event_id=str(event.outbox_event_id),
+                )
+            except Exception:  # noqa: BLE001 - observer cannot fail report generation
+                pass
         snapshot = self._interview.get_session_snapshot(context, session_id=session_id)
         criterion = self._company.get_criterion_version(
             context,
@@ -818,7 +869,7 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
         clock,
         metrics,
     )
-    return create_worker_runtime(
+    worker_runtime = create_worker_runtime(
         outbox=outbox,
         queues=aws.queues,
         processed=SQLProcessedMessageStore(database.session),
@@ -897,6 +948,33 @@ def create_production_worker_runtime(environment: Mapping[str, str]) -> WorkerRu
             "reporting": ReportGenerationFailureRecorder(lane_d.repository, clock)
         },
     )
+    if environment.get(
+        "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED", "false"
+    ).strip().casefold() in {
+        "1", "true", "yes", "on"
+    }:
+        session_id = str(
+            UUID(_required_worker_setting(environment, "CONTROLPROOF_WORKER_SESSION_ID"))
+        )
+        launcher_pid = int(
+            _required_worker_setting(environment, "CONTROLPROOF_WORKER_LAUNCHER_PID")
+        )
+        if launcher_pid < 1:
+            raise RuntimeError("ControlProof worker launcher PID is invalid")
+        worker_slot = int(_required_worker_setting(environment, "CONTROLPROOF_WORKER_SLOT"))
+        if worker_slot < 0:
+            raise RuntimeError("ControlProof worker slot is invalid")
+        observer_root = Path(
+            _required_worker_setting(environment, "CONTROLPROOF_OBSERVER_ROOT")
+        ).resolve()
+        worker_runtime.controlproof_attestation = (
+            observer_root,
+            session_id,
+            controlproof_ai_isolation_digest(environment),
+            launcher_pid,
+            worker_slot,
+        )
+    return worker_runtime
 
 
 def create_local_worker_runtime() -> WorkerRuntime:

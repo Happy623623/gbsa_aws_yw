@@ -51,18 +51,15 @@ def test_test_controls_are_rejected_in_production(control) -> None:
 
 
 def test_health_exposes_only_control_state_and_fixture_identity() -> None:
-    health = controlproof_health(
-        {
-            "APP_ENVIRONMENT": "test",
-            "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED": "true",
-        }
-    )
+    health = controlproof_health(_isolated_environment())
     assert health == {
         "fault_hooks_enabled": False,
         "fault_root_digest": None,
         "model_substitute_enabled": True,
         "fixture_id": FIXTURE_ID,
         "fixture_digest": FIXTURE_DIGEST,
+        "external_ai_isolated": True,
+        "ai_isolation_digest": health["ai_isolation_digest"],
     }
 
 
@@ -104,11 +101,7 @@ def test_fixed_model_is_deterministic_and_cites_input_evidence() -> None:
 def test_fixed_requirement_result_never_calls_external_fallback() -> None:
     evidence_id = str(uuid4())
     model = resolve_controlproof_model(
-        {
-            "APP_ENVIRONMENT": "local",
-            "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED": "true",
-            "CONTROLPROOF_MODEL_FIXTURE_ID": FIXTURE_ID,
-        },
+        _isolated_environment() | {"APP_ENVIRONMENT": "local"},
         fallback=object(),
     )
     result = model.generate(
@@ -133,3 +126,47 @@ def test_fixed_embedder_is_deterministic_and_has_requested_dimensions() -> None:
     assert first == second
     assert len(first) == 32
     assert sum(value * value for value in first) == pytest.approx(1.0)
+
+
+def _isolated_environment() -> dict[str, str]:
+    return {
+        "APP_ENVIRONMENT": "test",
+        "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED": "true",
+        "CONTROLPROOF_EXTERNAL_AI_ALLOWED": "false",
+        "AI_PROVIDER": "aws",
+        "EMBEDDING_PROVIDER": "aws",
+        "STT_PROVIDER": "disabled",
+        "TTS_PROVIDER": "text_only",
+        "BEDROCK_RUNTIME_ENDPOINT_URL": "http://127.0.0.1:4566",
+        "TRANSCRIBE_ENDPOINT_URL": "http://127.0.0.1:4566",
+        "POLLY_ENDPOINT_URL": "http://127.0.0.1:4566",
+        "GCP_DOCUMENT_AI_API_ENDPOINT": "127.0.0.1:4566",
+    }
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("BEDROCK_RUNTIME_ENDPOINT_URL", ""),
+        ("TRANSCRIBE_ENDPOINT_URL", "https://transcribe.amazonaws.com"),
+        ("POLLY_ENDPOINT_URL", "http://example.com"),
+        ("GCP_DOCUMENT_AI_API_ENDPOINT", "us-documentai.googleapis.com"),
+        ("AI_PROVIDER", "gcp"),
+        ("EMBEDDING_PROVIDER", "gcp"),
+        ("STT_PROVIDER", "gcp_streaming"),
+        ("TTS_PROVIDER", "gcp_unary"),
+        ("CONTROLPROOF_EXTERNAL_AI_ALLOWED", "true"),
+    ],
+)
+def test_fixed_profile_rejects_external_ai_routes(name: str, value: str) -> None:
+    environment = _isolated_environment()
+    environment[name] = value
+    with pytest.raises(RuntimeError):
+        validate_controlproof_test_controls(environment)
+
+
+def test_fixed_profile_health_attests_isolation_without_endpoint_disclosure() -> None:
+    health = controlproof_health(_isolated_environment())
+    assert health["external_ai_isolated"] is True
+    assert len(health["ai_isolation_digest"]) == 64
+    assert "127.0.0.1" not in json.dumps(health)

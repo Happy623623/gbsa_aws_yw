@@ -44,6 +44,14 @@ def test_local_health_exposes_no_secret_or_model_output() -> None:
         {
             "APP_ENVIRONMENT": "local",
             "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED": "true",
+            "AI_PROVIDER": "aws",
+            "EMBEDDING_PROVIDER": "aws",
+            "STT_PROVIDER": "disabled",
+            "TTS_PROVIDER": "text_only",
+            "BEDROCK_RUNTIME_ENDPOINT_URL": "http://127.0.0.1:4566",
+            "TRANSCRIBE_ENDPOINT_URL": "http://127.0.0.1:4566",
+            "POLLY_ENDPOINT_URL": "http://127.0.0.1:4566",
+            "GCP_DOCUMENT_AI_API_ENDPOINT": "127.0.0.1:4566",
         }
     )
     assert set(result) == {
@@ -52,6 +60,8 @@ def test_local_health_exposes_no_secret_or_model_output() -> None:
         "model_substitute_enabled",
         "fixture_id",
         "fixture_digest",
+        "external_ai_isolated",
+        "ai_isolation_digest",
     }
     assert result["fault_root_digest"] is None
     assert result["fixture_digest"] == FIXTURE_DIGEST

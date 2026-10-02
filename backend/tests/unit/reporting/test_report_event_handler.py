@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from uuid import UUID
 
+import pytest
 from interview_evidence.runtime.worker import (
     ReportRequestedEventHandler,
     _criterion_answers_by_criterion,
@@ -19,6 +20,53 @@ VERSION_ID = UUID("00000000-0000-7000-8000-000000000004")
 CRITERION_ID = UUID("00000000-0000-7000-8000-000000000005")
 QUESTION_TURN_ID = UUID("00000000-0000-7000-8000-000000000006")
 ANSWER_TURN_ID = UUID("00000000-0000-7000-8000-000000000007")
+
+
+@pytest.mark.parametrize("fault_guard_blocks", [False, True])
+def test_controlproof_report_start_receipt_follows_fault_guard(fault_guard_blocks: bool) -> None:
+    context = TenantContext(
+        company_id=COMPANY_ID,
+        actor_type=ActorType.SYSTEM,
+        actor_id=UUID("00000000-0000-7000-8000-000000000008"),
+        request_id=UUID("00000000-0000-7000-8000-000000000009"),
+        trace_id="controlproof:00000000-0000-7000-8000-000000000012:ASSESSMENT_BOUNDARY_PROBE:synthetic",
+    )
+    event = OutboxEvent(
+        outbox_event_id=UUID("00000000-0000-7000-8000-000000000010"),
+        company_id=COMPANY_ID,
+        aggregate_type="interview_session",
+        aggregate_id=SESSION_ID,
+        aggregate_version=1,
+        event_type="report.generation_requested",
+        event_version=1,
+        payload={"interview_session_id": str(SESSION_ID)},
+        idempotency_key="report-generation-request",
+        trace_id=context.trace_id,
+        occurred_at=NOW,
+    )
+    observer = Mock()
+    interview = Mock()
+    interview.get_session_snapshot.side_effect = RuntimeError("stop after start boundary")
+    guard = Mock()
+    if fault_guard_blocks:
+        guard.before_report_side_effect.side_effect = RuntimeError("blocked")
+    handler = ReportRequestedEventHandler(
+        company=Mock(),
+        interview=interview,
+        reporting=Mock(),
+        generator=Mock(),
+        clock=FrozenClock(NOW),
+        processing_observer=observer,
+        controlproof_fault_guard=guard,
+    )
+    with pytest.raises(RuntimeError):
+        handler(context, event)
+    boundaries = [call.kwargs["boundary"] for call in observer.record.call_args_list]
+    assert boundaries == (
+        ["REPORT_HANDLER_ENTERED"]
+        if fault_guard_blocks
+        else ["REPORT_HANDLER_ENTERED", "REPORT_ASSESSMENT_STARTED"]
+    )
 
 
 def test_report_request_uses_transcript_range_for_evidence() -> None:
@@ -56,8 +104,11 @@ def test_report_request_uses_transcript_range_for_evidence() -> None:
         ),
         interview_level="entry",
         axis_weights={},
+        job_requirements=(),
     )
-    company.get_recruiting_assistant_subject.return_value = SimpleNamespace()
+    company.get_recruiting_assistant_subject.return_value = SimpleNamespace(
+        applicant_id=UUID("00000000-0000-7000-8000-000000000012")
+    )
 
     interview = Mock()
     interview.get_session_snapshot.return_value = SimpleNamespace(

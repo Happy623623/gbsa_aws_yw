@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -11,6 +13,7 @@ from interview_evidence.runtime.worker import (
     EVENT_QUEUE_ROUTING,
     InterviewCompletedEventHandler,
     ParityProbeEventHandler,
+    WorkerRuntime,
     create_environment_worker_runtime,
 )
 from interview_evidence.shared.aws_clients.ports import InMemoryQueue
@@ -28,6 +31,9 @@ from interview_evidence.shared.messaging.worker import (
 )
 from interview_evidence.shared.operations import InMemoryMetricRecorder
 from interview_evidence.shared.tenant import ActorType, TenantContext
+
+import scripts.run_workers as worker_launcher
+from scripts.run_workers import _write_session_manifest
 
 NOW = datetime(2026, 8, 15, 9, 0, tzinfo=UTC)
 COMPANY_ID = UUID("00000000-0000-7000-8000-000000000101")
@@ -542,6 +548,151 @@ def test_local_worker_runtime_executes_a_cycle_without_cloud_dependencies() -> N
     )
 
     assert runtime.run_once() == 0
+
+
+def test_worker_cycle_attests_its_own_pid_and_isolation_profile(tmp_path) -> None:
+    runtime = create_environment_worker_runtime(
+        {"APP_ENVIRONMENT": "test", "WORKER_RUNTIME_MODE": "in-memory"}
+    )
+    session_id = str(uuid4())
+    runtime.controlproof_attestation = (tmp_path, session_id, "a" * 64, 1234, 0)
+    assert runtime.run_once() == 0
+    path = tmp_path / "worker-attestations" / f"{session_id}-{os.getpid()}.json"
+    proof = json.loads(path.read_text(encoding="utf-8"))
+    assert proof["worker_pid"] == os.getpid()
+    assert proof["launcher_pid"] == 1234
+    assert proof["worker_slot"] == 0
+    assert proof["ai_isolation_digest"] == "a" * 64
+
+
+def test_failed_worker_cycle_does_not_attest(tmp_path) -> None:
+    session_id = str(uuid4())
+
+    def fail_dispatch() -> int:
+        raise RuntimeError("cycle failed")
+
+    runtime = WorkerRuntime(
+        dispatcher=SimpleNamespace(dispatch_once=fail_dispatch),
+        consumers=(),
+        controlproof_attestation=(tmp_path, session_id, "a" * 64, 1234, 0),
+    )
+    with pytest.raises(RuntimeError, match="cycle failed"):
+        runtime.run_once()
+    assert not (tmp_path / "worker-attestations").exists()
+
+
+def test_unsafe_controlproof_worker_refuses_before_aws_dependency_creation(
+    monkeypatch,
+) -> None:
+    from interview_evidence.runtime import aws
+
+    constructed = []
+    monkeypatch.setattr(
+        aws,
+        "create_aws_runtime_dependencies",
+        lambda _environment: constructed.append(True),
+    )
+    with pytest.raises(RuntimeError, match="AI_PROVIDER"):
+        create_environment_worker_runtime(
+            {
+                "APP_ENVIRONMENT": "test",
+                "WORKER_RUNTIME_MODE": "production",
+                "CONTROLPROOF_MODEL_SUBSTITUTE_ENABLED": "true",
+            }
+        )
+    assert constructed == []
+
+
+def test_worker_launcher_manifest_names_every_child_pid(tmp_path) -> None:
+    session_id = str(uuid4())
+    path = _write_session_manifest(
+        tmp_path,
+        session_id=session_id,
+        isolation_digest="b" * 64,
+        worker_pids=[111, 222, 333],
+    )
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert manifest["session_id"] == session_id
+    assert manifest["expected_worker_count"] == 3
+    assert manifest["worker_pids"] == [111, 222, 333]
+    assert manifest["ai_isolation_digest"] == "b" * 64
+
+
+def test_worker_launcher_uses_attested_interpreter_pids_not_wrapper_pids(tmp_path) -> None:
+    session_id = str(uuid4())
+    directory = tmp_path / "worker-attestations"
+    directory.mkdir()
+    for slot, pid in ((0, 111), (1, 222)):
+        (directory / f"{session_id}-{pid}.json").write_text(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "launcher_pid": os.getpid(),
+                    "worker_slot": slot,
+                    "worker_pid": pid,
+                    "ai_isolation_digest": "b" * 64,
+                    "heartbeat_at": datetime.now(UTC).isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    assert worker_launcher._attested_worker_pids(
+        tmp_path, session_id=session_id, isolation_digest="b" * 64, concurrency=2
+    ) == [111, 222]
+    assert worker_launcher._attested_worker_pids(
+        tmp_path, session_id=session_id, isolation_digest="b" * 64, concurrency=3
+    ) is None
+
+
+def test_controlproof_worker_pool_rejects_second_launcher(tmp_path) -> None:
+    lock_path = tmp_path / "worker-pool.lock"
+    with worker_launcher._exclusive_pool_lock(lock_path), pytest.raises(
+        RuntimeError, match="already active"
+    ), worker_launcher._exclusive_pool_lock(lock_path):
+        pass
+
+
+def test_partial_worker_startup_cleans_up_first_child(tmp_path, monkeypatch) -> None:
+    started = []
+    cleaned = []
+
+    class Process:
+        pid = 9876
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            cleaned.append("terminate")
+
+        def kill(self):
+            cleaned.append("kill")
+
+    def popen(_args, **_kwargs):
+        if started:
+            raise OSError("second child failed")
+        started.append(Process())
+        return started[0]
+
+    monkeypatch.setattr(worker_launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        worker_launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: cleaned.append("taskkill"),
+    )
+    monkeypatch.setattr(worker_launcher.signal, "signal", lambda *_args: None)
+    with pytest.raises(OSError, match="second child failed"):
+        worker_launcher._run_pool(
+            2,
+            root=tmp_path,
+            session_id=str(uuid4()),
+            isolation_digest="c" * 64,
+        )
+    assert cleaned == (["taskkill"] if os.name == "nt" else ["terminate"])
+    assert not (tmp_path / "worker-session.json").exists()
 
 
 def test_worker_records_queue_depth_handler_latency_and_retry_outcome() -> None:

@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from interview_evidence.shared.tenant import TenantContext, require_tenant_context
 
@@ -16,6 +17,13 @@ FIXTURE_ID = "h03-report-v1"
 FIXTURE_SEED = "controlproof:h03-report-v1"
 FIXTURE_DIGEST = hashlib.sha256(FIXTURE_SEED.encode("utf-8")).hexdigest()
 ALLOWED_ENVIRONMENTS = frozenset({"local", "test"})
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_AI_ENDPOINTS = (
+    "BEDROCK_RUNTIME_ENDPOINT_URL",
+    "TRANSCRIBE_ENDPOINT_URL",
+    "POLLY_ENDPOINT_URL",
+    "GCP_DOCUMENT_AI_API_ENDPOINT",
+)
 
 
 def _enabled(environment: Mapping[str, str]) -> bool:
@@ -35,6 +43,54 @@ def validate_controlproof_test_controls(environment: Mapping[str, str]) -> None:
         in {"1", "true", "yes", "on"}
     ) and profile not in ALLOWED_ENVIRONMENTS:
         raise RuntimeError("ControlProof test controls are forbidden outside local/test")
+    if _enabled(environment):
+        controlproof_ai_isolation_digest(environment)
+
+
+def controlproof_ai_isolation_digest(environment: Mapping[str, str]) -> str:
+    """Fingerprint the only supported N-02 local AI route without exposing endpoints."""
+    if environment.get("APP_ENVIRONMENT", "").strip().casefold() not in ALLOWED_ENVIRONMENTS:
+        raise RuntimeError("ControlProof AI isolation requires local/test")
+    if environment.get("CONTROLPROOF_EXTERNAL_AI_ALLOWED", "false").strip().casefold() != "false":
+        raise RuntimeError("ControlProof external AI must be disabled")
+    required = {
+        "AI_PROVIDER": "aws",
+        "EMBEDDING_PROVIDER": "aws",
+        "STT_PROVIDER": "disabled",
+        "TTS_PROVIDER": "text_only",
+    }
+    for name, expected in required.items():
+        if environment.get(name, "").strip().casefold() != expected:
+            raise RuntimeError(f"ControlProof AI isolation requires {name}={expected}")
+    routes = {}
+    for name in _AI_ENDPOINTS:
+        value = environment.get(name, "").strip()
+        parsed = urlsplit(value if name != "GCP_DOCUMENT_AI_API_ENDPOINT" else f"http://{value}")
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise RuntimeError(f"ControlProof AI endpoint is invalid: {name}") from error
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in _LOOPBACK_HOSTS
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError(f"ControlProof AI endpoint must be loopback: {name}")
+        routes[name] = f"{parsed.hostname}:{port}"
+    payload = {
+        "contract": "controlproof.n02-ai-isolation.v1",
+        "fixture_id": environment.get("CONTROLPROOF_MODEL_FIXTURE_ID", FIXTURE_ID).strip(),
+        "fixture_digest": FIXTURE_DIGEST,
+        "providers": required,
+        "routes": routes,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ControlProofFixedModel:
@@ -149,6 +205,10 @@ def controlproof_health(environment: Mapping[str, str]) -> dict[str, Any]:
         "model_substitute_enabled": model_enabled,
         "fixture_id": FIXTURE_ID if model_enabled else None,
         "fixture_digest": FIXTURE_DIGEST if model_enabled else None,
+        "external_ai_isolated": model_enabled,
+        "ai_isolation_digest": (
+            controlproof_ai_isolation_digest(environment) if model_enabled else None
+        ),
     }
 
 
