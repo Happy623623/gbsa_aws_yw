@@ -386,36 +386,39 @@ class ReportRequestedEventHandler:
         self._controlproof_fault_guard = controlproof_fault_guard
         self._processing_observer = processing_observer
 
+    def _observe(self, event: OutboxEvent, boundary: str) -> None:
+        if self._processing_observer is None:
+            return
+        try:
+            parts = event.trace_id.split(":", 3)
+            self._processing_observer.record(
+                trace_id=event.trace_id,
+                path_id="AI_ASSESSMENT",
+                boundary=boundary,
+                subject_ref=parts[3] if len(parts) == 4 else "",
+                request_or_event_id=str(event.outbox_event_id),
+            )
+        except Exception:  # noqa: BLE001 - observer cannot fail report generation
+            pass
+
     def __call__(self, context: TenantContext, event: OutboxEvent) -> object:
         session_id = UUID(str(event.payload["interview_session_id"]))
-        if self._processing_observer is not None:
-            try:
-                parts = event.trace_id.split(":", 3)
-                self._processing_observer.record(
-                    trace_id=event.trace_id,
-                    path_id="AI_ASSESSMENT",
-                    boundary="REPORT_HANDLER_ENTERED",
-                    subject_ref=parts[3] if len(parts) == 4 else "",
-                    request_or_event_id=str(event.outbox_event_id),
-                )
-            except Exception:  # noqa: BLE001 - observer cannot fail report generation
-                pass
+        self._observe(event, "REPORT_HANDLER_ENTERED")
         if self._controlproof_fault_guard is not None:
             # This must remain before every report read/write or external model call.
             self._controlproof_fault_guard.before_report_side_effect(event)
-        if self._processing_observer is not None:
-            try:
-                parts = event.trace_id.split(":", 3)
-                self._processing_observer.record(
-                    trace_id=event.trace_id,
-                    path_id="AI_ASSESSMENT",
-                    boundary="REPORT_ASSESSMENT_STARTED",
-                    subject_ref=parts[3] if len(parts) == 4 else "",
-                    request_or_event_id=str(event.outbox_event_id),
-                )
-            except Exception:  # noqa: BLE001 - observer cannot fail report generation
-                pass
         snapshot = self._interview.get_session_snapshot(context, session_id=session_id)
+        consent = self._company.get_consent_authorization(
+            context,
+            snapshot.invitation_id,
+            required_purposes=frozenset({"ai_assessment"}),
+        )
+        if not consent.authorized:
+            # No AI assessment without active consent. Acknowledge so the refused
+            # request is not redelivered; nothing is read, written or generated.
+            self._observe(event, "REPORT_ASSESSMENT_REFUSED")
+            return None
+        self._observe(event, "REPORT_ASSESSMENT_STARTED")
         criterion = self._company.get_criterion_version(
             context,
             snapshot.competency_model_version_id,

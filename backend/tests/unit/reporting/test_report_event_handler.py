@@ -46,12 +46,17 @@ def test_controlproof_report_start_receipt_follows_fault_guard(fault_guard_block
     )
     observer = Mock()
     interview = Mock()
-    interview.get_session_snapshot.side_effect = RuntimeError("stop after start boundary")
+    interview.get_session_snapshot.return_value = SimpleNamespace(
+        invitation_id=INVITATION_ID, competency_model_version_id=VERSION_ID
+    )
+    company = Mock()
+    company.get_consent_authorization.return_value = SimpleNamespace(authorized=True)
+    company.get_criterion_version.side_effect = RuntimeError("stop after start boundary")
     guard = Mock()
     if fault_guard_blocks:
         guard.before_report_side_effect.side_effect = RuntimeError("blocked")
     handler = ReportRequestedEventHandler(
-        company=Mock(),
+        company=company,
         interview=interview,
         reporting=Mock(),
         generator=Mock(),
@@ -67,6 +72,56 @@ def test_controlproof_report_start_receipt_follows_fault_guard(fault_guard_block
         if fault_guard_blocks
         else ["REPORT_HANDLER_ENTERED", "REPORT_ASSESSMENT_STARTED"]
     )
+
+
+def test_report_handler_refuses_without_active_ai_assessment_consent() -> None:
+    """T083: ControlProof N-02 child e2e8e71d recorded REPORT_ASSESSMENT_STARTED for
+    unconsented subjects. The handler must refuse before the start boundary, record the
+    refusal and finish without retry or any report read, write or model call."""
+    context = TenantContext(
+        company_id=COMPANY_ID,
+        actor_type=ActorType.SYSTEM,
+        actor_id=UUID("00000000-0000-7000-8000-000000000008"),
+        request_id=UUID("00000000-0000-7000-8000-000000000009"),
+        trace_id="controlproof:00000000-0000-7000-8000-000000000012:ASSESSMENT_BOUNDARY_PROBE:synthetic",
+    )
+    event = OutboxEvent(
+        outbox_event_id=UUID("00000000-0000-7000-8000-000000000010"),
+        company_id=COMPANY_ID,
+        aggregate_type="interview_session",
+        aggregate_id=SESSION_ID,
+        aggregate_version=1,
+        event_type="report.generation_requested",
+        event_version=1,
+        payload={"interview_session_id": str(SESSION_ID)},
+        idempotency_key="report-generation-request",
+        trace_id=context.trace_id,
+        occurred_at=NOW,
+    )
+    observer, interview, company, reporting, generator = Mock(), Mock(), Mock(), Mock(), Mock()
+    interview.get_session_snapshot.return_value = SimpleNamespace(
+        invitation_id=INVITATION_ID, competency_model_version_id=VERSION_ID
+    )
+    company.get_consent_authorization.return_value = SimpleNamespace(authorized=False)
+    handler = ReportRequestedEventHandler(
+        company=company,
+        interview=interview,
+        reporting=reporting,
+        generator=generator,
+        clock=FrozenClock(NOW),
+        processing_observer=observer,
+    )
+
+    assert handler(context, event) is None
+    assert [call.kwargs["boundary"] for call in observer.record.call_args_list] == [
+        "REPORT_HANDLER_ENTERED",
+        "REPORT_ASSESSMENT_REFUSED",
+    ]
+    company.get_consent_authorization.assert_called_once_with(
+        context, INVITATION_ID, required_purposes=frozenset({"ai_assessment"})
+    )
+    company.get_criterion_version.assert_not_called()
+    assert reporting.method_calls == [] and generator.method_calls == []
 
 
 def test_report_request_uses_transcript_range_for_evidence() -> None:
