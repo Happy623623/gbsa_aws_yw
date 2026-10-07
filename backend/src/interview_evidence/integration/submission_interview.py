@@ -57,6 +57,17 @@ class SubmissionInterviewBoundary:
         acknowledged_partial_analysis: bool,
     ) -> InterviewAuthorization:
         context.assert_company(principal.company_id)
+        # No recording session without active recording consent, whatever the strategy
+        # state says (ControlProof Spec 003 T082). A missing consent source fails closed.
+        if self._company is None:
+            raise InterviewAuthorizationDenied("consent authorization is unavailable")
+        consent = self._company.get_consent_authorization(
+            context,
+            principal.invitation_id,
+            required_purposes=frozenset({"recording"}),
+        )
+        if not consent.authorized:
+            raise InterviewAuthorizationDenied("active recording consent is required")
         try:
             strategy = self._submission.get_strategy_snapshot(
                 context,
