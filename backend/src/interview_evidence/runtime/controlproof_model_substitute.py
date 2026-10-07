@@ -160,7 +160,7 @@ class ControlProofFixedModel:
         raise ValueError(f"ControlProof fixed model does not support task: {task}")
 
 
-_SPEC004_MARKER = re.compile(r"^\[controlproof-spec004(?P<body>[^\]]*)\]")
+_SPEC004_MARKER = re.compile(r"^\[controlproof-spec004(?P<body>\s[^\]]*)?\]")
 _SPEC004_MODES = frozenset({"VALID", "EMPTY", "NONEXISTENT", "OTHER_APPLICANT", "OTHER_CRITERION"})
 _SPEC004_ARGUMENT_MODES = frozenset({"NONEXISTENT", "OTHER_APPLICANT", "OTHER_CRITERION"})
 _SPEC004_DEFAULT_SCORE = 72
@@ -178,9 +178,10 @@ def _spec004_marker(text: str) -> tuple[str, str | None, int | None, str]:
     """
     match = _SPEC004_MARKER.match(text)
     if match is None:
-        return "DEFAULT", None, None, "EMITTED"
+        status = "MARKER_INVALID" if text.startswith("[controlproof-spec004") else "EMITTED"
+        return "DEFAULT", None, None, status
     fields: dict[str, str] = {}
-    for token in match.group("body").split():
+    for token in (match.group("body") or "").split():
         key, separator, value = token.partition("=")
         if not separator or key not in {"mode", "arg", "score"} or key in fields:
             return "DEFAULT", None, None, "MARKER_INVALID"
@@ -213,10 +214,9 @@ class ControlProofSpec004Model:
     """Deterministic Spec 004 substitute: the criterion text picks what the model cites.
 
     ``OTHER_CRITERION`` reuses the Evidence ID this instance was given for an earlier criterion,
-    but only when both IDs carry the same UUIDv7 millisecond: the report generator stamps every
-    Evidence of one ``generate`` call with the same ``occurred_at``, so a match keeps the memory
-    inside one report (one session, one applicant). Another applicant's ID is never remembered;
-    ``OTHER_APPLICANT`` cites only the ID the runner put in the marker.
+    scoped by company and report request (the worker's Outbox event ID). A UUIDv7 millisecond
+    match is an additional stale-retry check, not report identity. Another company's or another
+    request's memory is never used; ``OTHER_APPLICANT`` cites only the marker's explicit ID.
     """
 
     fixture_id = SPEC004_FIXTURE_ID
@@ -225,7 +225,7 @@ class ControlProofSpec004Model:
     def __init__(self, observer_root: Path | None = None) -> None:
         self._observer_root = observer_root
         self._h03 = ControlProofFixedModel()
-        self._provided: OrderedDict[str, str] = OrderedDict()
+        self._provided: OrderedDict[tuple[UUID, UUID, str], str] = OrderedDict()
         self._lock = threading.Lock()
 
     def generate(
@@ -234,6 +234,7 @@ class ControlProofSpec004Model:
         model_input: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         require_tenant_context(context)
+        scope = (context.company_id, context.request_id)
         payload = _task_payload(model_input)
         if payload.get("task") != "assess_interview_criterion":
             return self._h03.generate(context, model_input)
@@ -245,10 +246,10 @@ class ControlProofSpec004Model:
         quoted: list[str] = []
         emitted_score: int | None = None
         if provided:
-            quoted, status = self._citation(mode, argument, provided, status)
+            quoted, status = self._citation(scope, mode, argument, provided, status)
             if status != "MODE_SOURCE_MISSING":
                 emitted_score = _SPEC004_DEFAULT_SCORE if score is None else score
-            self._remember(criterion_id, provided[0])
+            self._remember(scope, criterion_id, provided[0])
         self._write_receipt(criterion_id, mode, status, provided, quoted, emitted_score)
         return {
             "criterion_id": payload["criterion"]["criterion_id"],
@@ -267,7 +268,12 @@ class ControlProofSpec004Model:
         }
 
     def _citation(
-        self, mode: str, argument: str | None, provided: list[str], status: str
+        self,
+        scope: tuple[UUID, UUID],
+        mode: str,
+        argument: str | None,
+        provided: list[str],
+        status: str,
     ) -> tuple[list[str], str]:
         if mode in {"DEFAULT", "VALID"}:
             return provided[:1], status
@@ -276,16 +282,17 @@ class ControlProofSpec004Model:
         if mode in {"NONEXISTENT", "OTHER_APPLICANT"}:
             return [str(argument)], status
         with self._lock:
-            remembered = self._provided.get(str(argument))
+            remembered = self._provided.get((*scope, str(argument)))
         current = _uuid7_millis(provided[0])
         if remembered is None or current is None or _uuid7_millis(remembered) != current:
             return [], "MODE_SOURCE_MISSING"
         return [remembered], status
 
-    def _remember(self, criterion_id: str, evidence_id: str) -> None:
+    def _remember(self, scope: tuple[UUID, UUID], criterion_id: str, evidence_id: str) -> None:
+        key = (*scope, criterion_id)
         with self._lock:
-            self._provided[criterion_id] = evidence_id
-            self._provided.move_to_end(criterion_id)
+            self._provided[key] = evidence_id
+            self._provided.move_to_end(key)
             while len(self._provided) > _SPEC004_MEMORY_LIMIT:
                 self._provided.popitem(last=False)
 

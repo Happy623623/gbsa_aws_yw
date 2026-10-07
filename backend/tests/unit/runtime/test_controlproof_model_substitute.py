@@ -218,8 +218,10 @@ def _receipts(root: Path) -> list[dict]:
     ]
 
 
-def _generate(model, criterion_id, text, evidence_ids):
-    return model.generate(_context(), _input(_criterion_payload(criterion_id, text, evidence_ids)))
+def _generate(model, criterion_id, text, evidence_ids, *, context=None):
+    return model.generate(
+        context or _context(), _input(_criterion_payload(criterion_id, text, evidence_ids))
+    )
 
 
 def test_h03_fixture_identity_is_unchanged() -> None:
@@ -306,21 +308,35 @@ def test_spec004_marker_argument_modes_cite_only_the_argument(mode: str) -> None
 
 def test_spec004_other_criterion_uses_the_same_call_memory() -> None:
     model = ControlProofSpec004Model()
+    context = _context()
     valid_criterion, valid_evidence = uuid4(), new_uuid7(_AT)
-    _generate(model, valid_criterion, "[controlproof-spec004 mode=VALID]", [valid_evidence])
+    _generate(
+        model,
+        valid_criterion,
+        "[controlproof-spec004 mode=VALID]",
+        [valid_evidence],
+        context=context,
+    )
     marker = f"[controlproof-spec004 mode=OTHER_CRITERION arg={valid_criterion}]"
-    result = _generate(model, uuid4(), marker, [new_uuid7(_AT)])
+    result = _generate(model, uuid4(), marker, [new_uuid7(_AT)], context=context)
     assert _quoted(result) == {(str(valid_evidence),)}
     assert _scores(result) == {72}
 
 
 def test_spec004_other_criterion_refuses_memory_from_another_call() -> None:
     model = ControlProofSpec004Model()
+    context = _context()
     valid_criterion = uuid4()
-    _generate(model, valid_criterion, "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)])
+    _generate(
+        model,
+        valid_criterion,
+        "[controlproof-spec004 mode=VALID]",
+        [new_uuid7(_AT)],
+        context=context,
+    )
     later = new_uuid7(_AT + timedelta(milliseconds=1))
     marker = f"[controlproof-spec004 mode=OTHER_CRITERION arg={valid_criterion}]"
-    result = _generate(model, uuid4(), marker, [later])
+    result = _generate(model, uuid4(), marker, [later], context=context)
     assert _quoted(result) == {()}
     assert _scores(result) == {None}
 
@@ -343,12 +359,47 @@ def test_spec004_other_applicant_never_reads_memory() -> None:
 
 def test_spec004_memory_is_bounded() -> None:
     model = ControlProofSpec004Model()
+    context = _context()
     oldest = uuid4()
-    _generate(model, oldest, "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)])
+    _generate(model, oldest, "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)], context=context)
     for _ in range(256):
-        _generate(model, uuid4(), "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)])
+        _generate(
+            model, uuid4(), "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)], context=context
+        )
     marker = f"[controlproof-spec004 mode=OTHER_CRITERION arg={oldest}]"
-    assert _quoted(_generate(model, uuid4(), marker, [new_uuid7(_AT)])) == {()}
+    assert _quoted(_generate(model, uuid4(), marker, [new_uuid7(_AT)], context=context)) == {()}
+
+
+@pytest.mark.parametrize("boundary", ["company_id", "request_id"])
+def test_spec004_same_millisecond_cannot_cross_report_scope(boundary, tmp_path):
+    model = ControlProofSpec004Model(observer_root=tmp_path)
+    context = _context()
+    other = context.model_copy(update={boundary: uuid4()})
+    criterion = uuid4()
+    _generate(
+        model, criterion, "[controlproof-spec004 mode=VALID]", [new_uuid7(_AT)], context=context
+    )
+    marker = f"[controlproof-spec004 mode=OTHER_CRITERION arg={criterion}]"
+    result = _generate(model, uuid4(), marker, [new_uuid7(_AT)], context=other)
+    assert _quoted(result) == {()}
+    assert _scores(result) == {None}
+    assert any(row["mode_status"] == "MODE_SOURCE_MISSING" for row in _receipts(tmp_path))
+
+
+def test_spec004_interleaved_reports_keep_separate_criterion_memory():
+    model = ControlProofSpec004Model()
+    first = _context()
+    second = first.model_copy(update={"request_id": uuid4()})
+    criterion = uuid4()
+    first_evidence, second_evidence = new_uuid7(_AT), new_uuid7(_AT)
+    for context, evidence in ((first, first_evidence), (second, second_evidence)):
+        _generate(
+            model, criterion, "[controlproof-spec004 mode=VALID]", [evidence], context=context
+        )
+    marker = f"[controlproof-spec004 mode=OTHER_CRITERION arg={criterion}]"
+    for context, evidence in ((first, first_evidence), (second, second_evidence)):
+        result = _generate(model, uuid4(), marker, [new_uuid7(_AT)], context=context)
+        assert _quoted(result) == {(str(evidence),)}
 
 
 def test_spec004_without_answers_scores_nothing_in_every_mode() -> None:
@@ -368,6 +419,8 @@ def test_spec004_without_answers_scores_nothing_in_every_mode() -> None:
         "[controlproof-spec004 mode=VALID arg=00000000-0000-0000-0000-000000000001]",
         "[controlproof-spec004 mode=VALID mode=EMPTY]",
         "[controlproof-spec004 score=50]",
+        "[controlproof-spec004 mode=EMPTY",
+        "[controlproof-spec004mode=EMPTY]",
     ],
 )
 def test_spec004_invalid_marker_falls_back_to_default(marker: str, tmp_path: Path) -> None:
